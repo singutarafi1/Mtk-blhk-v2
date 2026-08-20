@@ -473,13 +473,17 @@ class MtkBromProtocolEngine(
         isSimulation: Boolean
     ): String {
         val sessionFolder = "${chipPlatform}_Backup_${folderDateFormat.format(Date())}"
-        val backupDir = storageManager.getBackupDirectory().absolutePath
-        val targetPath = "$backupDir/$sessionFolder"
+        val backupDir = java.io.File(storageManager.getBackupDirectory(), sessionFolder)
+        if (!backupDir.exists()) {
+            backupDir.mkdirs()
+        }
+        val targetPath = backupDir.absolutePath
 
         log("[AUTO-BACKUP] Preparing Safety Backup Session: $sessionFolder", LogLevel.INFO)
         log("[AUTO-BACKUP] Destination Storage: $targetPath", LogLevel.INFO)
 
-        val nvPartNames = listOf("nvram", "nvdata", "protect1", "protect2", "secro", "nvcfg")
+        val isModern = isModernChip(chipPlatform)
+        val nvPartNames = listOf("nvram", "nvdata", "protect1", "protect2", "secro", "nvcfg", "proinfo")
         val effectiveList = partitions.filter { it.partitionName.lowercase() in nvPartNames }.ifEmpty {
             listOf(
                 PartitionEntry(2, "nvram", "nvram.bin", "0x80000", "0x80000", "0x500000", 5242880, "EMMC_USER", true, true),
@@ -492,11 +496,23 @@ class MtkBromProtocolEngine(
         }
 
         for (part in effectiveList) {
-            val fakeData = ByteArray(1024) { 0x5A }
-            val md = MessageDigest.getInstance("SHA-256")
-            val sha256 = md.digest(fakeData).joinToString("") { "%02x".format(it) }
-            storageManager.savePartitionDump(part.partitionName, fakeData, sha256, sessionFolder)
-            log("[+] NV Backup: ${part.partitionName}.bin saved (SHA-256 verified)", LogLevel.SUCCESS)
+            val outFile = java.io.File(backupDir, "${part.partitionName}.bin")
+            val isUfs = isModern || part.region.contains("UFS", ignoreCase = true) || part.region.contains("LU", ignoreCase = true)
+            val (stType, pSection) = flashEngine.resolveStorageTarget(part.partitionName, part.region, isUfs)
+
+            val dumpRes = dumpEngine.dumpPartition(
+                partition = part,
+                outputFile = outFile,
+                isSimulation = isSimulation,
+                storageType = stType,
+                partType = pSection
+            )
+
+            if (dumpRes.isSuccess) {
+                log("[+] NV Backup: ${part.partitionName}.bin saved (${outFile.length() / 1024} KB)", LogLevel.SUCCESS)
+            } else {
+                log("[-] NV Backup skipped/error for ${part.partitionName}", LogLevel.WARNING)
+            }
         }
 
         val scatterPath = storageManager.generateScatterFile(chipPlatform, partitions, sessionFolder)
@@ -504,6 +520,14 @@ class MtkBromProtocolEngine(
         log("[AUTO-BACKUP] Complete. Saved to File Manager: $targetPath", LogLevel.SUCCESS)
 
         return targetPath
+    }
+
+    private fun isModernChip(platform: String): Boolean {
+        val p = platform.lowercase()
+        return p.contains("6833") || p.contains("6877") || p.contains("6893") ||
+                p.contains("6885") || p.contains("6853") || p.contains("6873") ||
+                p.contains("6983") || p.contains("6785") || p.contains("6768") ||
+                p.contains("dimensity")
     }
 
     private fun resolveChipName(hwCode: String): String {
@@ -613,25 +637,37 @@ class MtkBromProtocolEngine(
 
         // STEP 2: Partition Write (Phase 1 Engine)
         log("[STEP 2/3] Writing image payload to ${partition.partitionName} (${partition.linearStartAddrHex})...", LogLevel.INFO)
-        val payloadData = if (sourceImageData != null && sourceImageData.isNotEmpty()) {
-            sourceImageData
-        } else {
-            val totalBytes = if (partition.sizeBytes > 0) partition.sizeBytes.toInt() else 4194304
-            ByteArray(totalBytes) { 0x55 }
+        if (sourceImageData == null || sourceImageData.isEmpty()) {
+            log("[-] [FLASH FAIL]: No firmware/image data provided for '${partition.partitionName}'. Flashing cancelled.", LogLevel.ERROR)
+            progressCallback(OperationProgress(isRunning = false))
+            return Result.failure(IllegalArgumentException("No image payload provided for ${partition.partitionName}"))
         }
+        val payloadData = sourceImageData
 
+        val isModern = isModernChip(partition.region) || partition.region.contains("UFS", ignoreCase = true) || partition.region.contains("LU", ignoreCase = true)
         val (storageType, partSection) = flashEngine.resolveStorageTarget(
             partitionName = partition.partitionName,
-            region = partition.region
+            region = partition.region,
+            isUfs = isModern
         )
 
-        val flashSuccess = flashEngine.flashLegacy(
-            partition = partition,
-            data = payloadData,
-            isSimulation = isSimulation,
-            storageType = storageType,
-            partType = partSection
-        )
+        val flashSuccess = if (isModern || storageType == MtkFlashEngine.StorageType.UFS) {
+            flashEngine.flashXFlash(
+                partition = partition,
+                data = payloadData,
+                isSimulation = isSimulation,
+                storageType = storageType,
+                partType = partSection
+            )
+        } else {
+            flashEngine.flashLegacy(
+                partition = partition,
+                data = payloadData,
+                isSimulation = isSimulation,
+                storageType = storageType,
+                partType = partSection
+            )
+        }
 
         if (!flashSuccess) {
             log("[-] [FLASH FAIL]: Flashing failed at partition: ${partition.partitionName} (Start Addr: ${partition.linearStartAddrHex})", LogLevel.ERROR)
@@ -914,7 +950,7 @@ class MtkBromProtocolEngine(
         if (autoNvBackup) {
             performAutoBackupAndScatterPipeline(chipPlatform, partitions, isSimulation)
         }
-        val res = formatEngine.disableMiAccount(partitions, isSimulation)
+        val res = formatEngine.disableMiAccount(partitions, isSimulation, chipPlatform = chipPlatform)
         if (res.isSuccess && autoReboot) {
             rebootDevice("Android System", isSimulation)
         }
@@ -1018,7 +1054,7 @@ class MtkBromProtocolEngine(
         } else {
             log("[AUTO-BACKUP] Auto NV Data Backup is SKIPPED (Unchecked by user).", LogLevel.INFO)
         }
-        val res = formatEngine.eraseFrp(partitions, isSimulation)
+        val res = formatEngine.eraseFrp(partitions, isSimulation, chipPlatform = chipPlatform)
         if (res.isSuccess && autoReboot) {
             rebootDevice("Android System", isSimulation)
         }
@@ -1094,7 +1130,7 @@ class MtkBromProtocolEngine(
         } else {
             log("[AUTO-BACKUP] Auto NV Data Backup is SKIPPED (Unchecked by user).", LogLevel.INFO)
         }
-        val res = formatEngine.factoryReset(partitions, isSimulation)
+        val res = formatEngine.factoryReset(partitions, isSimulation, chipPlatform = chipPlatform)
         if (res.isSuccess && autoReboot) {
             rebootDevice("Android System", isSimulation)
         }
@@ -1105,7 +1141,8 @@ class MtkBromProtocolEngine(
     suspend fun formatPartition(
         partition: PartitionEntry,
         isSimulation: Boolean,
-        autoReboot: Boolean = false
+        autoReboot: Boolean = false,
+        chipPlatform: String = ""
     ): Result<Boolean> {
         val probeRes = readDetailedDeviceInfo(isSimulation)
         if (probeRes.isFailure) {
@@ -1114,7 +1151,7 @@ class MtkBromProtocolEngine(
             return Result.failure(probeRes.exceptionOrNull() ?: IllegalStateException("Handshake failed"))
         }
 
-        val res = formatEngine.formatPartition(partition, isSimulation)
+        val res = formatEngine.formatPartition(partition, isSimulation, chipPlatform = chipPlatform)
         if (res.isSuccess && autoReboot) {
             rebootDevice("Android System", isSimulation)
         }

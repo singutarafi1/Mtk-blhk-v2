@@ -83,7 +83,7 @@ class MtkDumpEngine(
 
                     val cmdHeader = ByteBuffer.allocate(12 + paramBuf.array().size).order(ByteOrder.LITTLE_ENDIAN)
                     cmdHeader.putInt(XFLASH_MAGIC.toInt())
-                    cmdHeader.putInt(1) // DT_PROTOCOL_FLOW
+                    cmdHeader.putInt(XFLASH_CMD_READ_DATA)
                     cmdHeader.putInt(paramBuf.array().size)
                     cmdHeader.put(paramBuf.array())
 

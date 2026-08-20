@@ -25,8 +25,9 @@ class MtkFormatEngine(
 ) {
 
     companion object {
-        const val XFLASH_CMD_FORMAT_DATA = 0x010007
-        const val XFLASH_CMD_ERASE_DATA = 0x010008
+        const val XFLASH_CMD_FORMAT = 0x010003
+        const val XFLASH_CMD_ERASE = 0x010005
+        const val XFLASH_CMD_FORMAT_PARTITION = 0x010006
         const val LEGACY_CMD_FORMAT = 0x64.toByte()
         const val LEGACY_ACK: Byte = 0x5A.toByte()
         const val ZERO_CHUNK_SIZE = 131072 // 128KB zero block
@@ -42,16 +43,28 @@ class MtkFormatEngine(
     suspend fun formatPartition(
         partition: PartitionEntry,
         isSimulation: Boolean = false,
-        useDirectZeroFill: Boolean = true
+        useDirectZeroFill: Boolean = false,
+        chipPlatform: String = ""
     ): Result<Boolean> {
         val startAddr = partition.startLinearAddress
         val totalBytes = if (partition.sizeBytes > 0) partition.sizeBytes else 4194304L
 
         log("[FORMAT] Erasing partition '${partition.partitionName}' @ 0x%X (Length: ${totalBytes / 1024} KB)".format(startAddr), LogLevel.WARNING)
 
+        val isModern = chipPlatform.contains("6833", ignoreCase = true) ||
+                chipPlatform.contains("6877", ignoreCase = true) ||
+                chipPlatform.contains("6893", ignoreCase = true) ||
+                chipPlatform.contains("6885", ignoreCase = true) ||
+                chipPlatform.contains("6853", ignoreCase = true) ||
+                chipPlatform.contains("6785", ignoreCase = true) ||
+                chipPlatform.contains("6768", ignoreCase = true) ||
+                partition.region.contains("UFS", ignoreCase = true) ||
+                partition.region.contains("LU", ignoreCase = true)
+
         val (storageType, partSection) = flashEngine.resolveStorageTarget(
             partitionName = partition.partitionName,
-            region = partition.region
+            region = partition.region,
+            isUfs = isModern
         )
 
         val startTime = System.currentTimeMillis()
@@ -62,8 +75,10 @@ class MtkFormatEngine(
             return Result.success(true)
         }
 
-        if (storageType == MtkFlashEngine.StorageType.UFS) {
-            // Send XFlash Format Command (0x010007)
+        var formatSuccess = false
+
+        if (storageType == MtkFlashEngine.StorageType.UFS || isModern) {
+            // Send XFlash Format Command (0x010007 / 0x010008)
             val paramBuf = ByteBuffer.allocate(4 + 4 + 8 + 8 + (8 * 4)).order(ByteOrder.LITTLE_ENDIAN)
             paramBuf.putInt(storageType.value)
             paramBuf.putInt(partSection)
@@ -73,14 +88,16 @@ class MtkFormatEngine(
 
             val cmdHeader = ByteBuffer.allocate(12 + paramBuf.array().size).order(ByteOrder.LITTLE_ENDIAN)
             cmdHeader.putInt(MtkFlashEngine.XFLASH_MAGIC.toInt())
-            cmdHeader.putInt(1) // DT_PROTOCOL_FLOW
+            cmdHeader.putInt(XFLASH_CMD_FORMAT)
             cmdHeader.putInt(paramBuf.array().size)
             cmdHeader.put(paramBuf.array())
 
             val wrote = usb.writeRaw(cmdHeader.array(), 3000)
-            if (wrote <= 0) {
-                log("[-] DA rejected XFlash format command for ${partition.partitionName}", LogLevel.ERROR)
-                return Result.failure(IllegalStateException("DA format command rejected"))
+            if (wrote > 0) {
+                formatSuccess = true
+                log("[+] DA XFlash Format Command executed for ${partition.partitionName}", LogLevel.SUCCESS)
+            } else {
+                log("[-] DA rejected XFlash format command for ${partition.partitionName}", LogLevel.WARNING)
             }
         } else {
             // Send Legacy DA Format Command (0x64)
@@ -92,29 +109,39 @@ class MtkFormatEngine(
             fmtBuf.putLong(totalBytes)
 
             val wrote = usb.writeRaw(fmtBuf.array(), 3000)
-            if (wrote <= 0) {
-                log("[-] DA rejected Legacy format command for ${partition.partitionName}", LogLevel.ERROR)
-                return Result.failure(IllegalStateException("DA Legacy format command rejected"))
-            }
-
-            val ackBuf = ByteArray(1)
-            val ackRead = usb.readRaw(ackBuf, 5000)
-            if (ackRead <= 0 || ackBuf[0] != LEGACY_ACK) {
-                log("[-] Target did not ACK format command (got 0x%02X)".format(if (ackRead > 0) ackBuf[0] else 0), LogLevel.WARNING)
+            if (wrote > 0) {
+                val ackBuf = ByteArray(1)
+                val ackRead = usb.readRaw(ackBuf, 3000)
+                if (ackRead > 0 && ackBuf[0] == LEGACY_ACK) {
+                    formatSuccess = true
+                    log("[+] Legacy DA Format ACK received for ${partition.partitionName}", LogLevel.SUCCESS)
+                } else {
+                    log("[-] Target did not ACK Legacy format command (got 0x%02X)".format(if (ackRead > 0) ackBuf[0] else 0), LogLevel.WARNING)
+                }
             }
         }
 
-        // If explicit zero-fill is requested, write zero data via properly framed flash protocol
-        if (useDirectZeroFill) {
+        // If hardware format command was not supported or explicit zero-fill requested, flash zeros using matching protocol
+        if (!formatSuccess && useDirectZeroFill) {
             val zeroChunkSize = minOf(totalBytes, 1048576L).toInt()
             val zeroData = ByteArray(zeroChunkSize) { 0x00 }
-            flashEngine.flashLegacy(
-                partition = partition.copy(sizeBytes = zeroChunkSize.toLong()),
-                data = zeroData,
-                isSimulation = false,
-                storageType = storageType,
-                partType = partSection
-            )
+            if (isModern || storageType == MtkFlashEngine.StorageType.UFS) {
+                formatSuccess = flashEngine.flashXFlash(
+                    partition = partition.copy(sizeBytes = zeroChunkSize.toLong()),
+                    data = zeroData,
+                    isSimulation = false,
+                    storageType = storageType,
+                    partType = partSection
+                )
+            } else {
+                formatSuccess = flashEngine.flashLegacy(
+                    partition = partition.copy(sizeBytes = zeroChunkSize.toLong()),
+                    data = zeroData,
+                    isSimulation = false,
+                    storageType = storageType,
+                    partType = partSection
+                )
+            }
         }
 
         updateProgress("Formatting: ${partition.partitionName}", totalBytes, totalBytes, startTime)
@@ -127,7 +154,8 @@ class MtkFormatEngine(
      */
     suspend fun eraseFrp(
         partitions: List<PartitionEntry>,
-        isSimulation: Boolean = false
+        isSimulation: Boolean = false,
+        chipPlatform: String = ""
     ): Result<Boolean> {
         log("==================================================", LogLevel.WARNING)
         log(">>> [ERASE FRP] Google Account Lock Bypass Triggered", LogLevel.WARNING)
@@ -151,7 +179,7 @@ class MtkFormatEngine(
         log("[FRP] Target Partition Address: ${frpPart.linearStartAddrHex} (Size: ${frpPart.sizeBytes / 1024} KB)", LogLevel.INFO)
         log("[FRP] Zeroing FRP partition persistent lock tokens...", LogLevel.INFO)
 
-        val res = formatPartition(frpPart, isSimulation, useDirectZeroFill = true)
+        val res = formatPartition(frpPart, isSimulation, useDirectZeroFill = true, chipPlatform = chipPlatform)
 
         if (res.isSuccess) {
             log("==================================================", LogLevel.SUCCESS)
@@ -170,7 +198,8 @@ class MtkFormatEngine(
      */
     suspend fun factoryReset(
         partitions: List<PartitionEntry>,
-        isSimulation: Boolean = false
+        isSimulation: Boolean = false,
+        chipPlatform: String = ""
     ): Result<Boolean> {
         log("==================================================", LogLevel.WARNING)
         log(">>> [FACTORY RESET] Wiping Userdata, Metadata & Cache", LogLevel.WARNING)
@@ -189,7 +218,7 @@ class MtkFormatEngine(
             // Format first 64MB of large partitions to sanitize superblocks/encryption master keys instantly and cleanly
             val effectiveSize = minOf(part.sizeBytes, 64L * 1024L * 1024L)
             val sanitizePart = part.copy(sizeBytes = effectiveSize)
-            val res = formatPartition(sanitizePart, isSimulation, useDirectZeroFill = true)
+            val res = formatPartition(sanitizePart, isSimulation, useDirectZeroFill = true, chipPlatform = chipPlatform)
             if (res.isFailure) {
                 log("[-] Warning: Wipe failed on ${part.partitionName}", LogLevel.WARNING)
             }
@@ -207,7 +236,8 @@ class MtkFormatEngine(
      */
     suspend fun disableMiAccount(
         partitions: List<PartitionEntry>,
-        isSimulation: Boolean = false
+        isSimulation: Boolean = false,
+        chipPlatform: String = ""
     ): Result<Boolean> {
         log("==================================================", LogLevel.WARNING)
         log(">>> [DISABLE MI ACCOUNT] Clearing Xiaomi Cloud Tokens", LogLevel.WARNING)
@@ -222,7 +252,7 @@ class MtkFormatEngine(
         val targetSize = minOf(persistPart.sizeBytes, 1048576L)
         val clearPart = persistPart.copy(sizeBytes = targetSize)
 
-        val res = formatPartition(clearPart, isSimulation, useDirectZeroFill = true)
+        val res = formatPartition(clearPart, isSimulation, useDirectZeroFill = true, chipPlatform = chipPlatform)
 
         if (res.isSuccess) {
             log("==================================================", LogLevel.SUCCESS)
