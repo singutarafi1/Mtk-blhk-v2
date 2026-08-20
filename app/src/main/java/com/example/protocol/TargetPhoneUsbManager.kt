@@ -458,36 +458,71 @@ class TargetPhoneUsbManager(
         }
     }
 
+    fun flush(timeoutMs: Int = 10): Int {
+        val conn = usbConnection ?: return 0
+        val ep = inEndpoint ?: return 0
+        val tempBuf = ByteArray(1024)
+        var totalFlushed = 0
+        while (true) {
+            val r = conn.bulkTransfer(ep, tempBuf, tempBuf.size, timeoutMs)
+            if (r > 0) {
+                totalFlushed += r
+            } else {
+                break
+            }
+        }
+        return totalFlushed
+    }
+
     /**
-     * Executes MTK handshake sync sequence byte-by-byte (0xA0->0x5F, 0x0A->0xF5, 0x50->0xAF, 0x05->0xFA)
-     * to hook BROM before the device exits bootrom mode.
+     * Executes MTK handshake sync sequence matching mtkclient python implementation:
+     * 1. Flushes leftover USB buffer.
+     * 2. Repeatedly sends 0xA0 until 0x5F echo is locked.
+     * 3. Sends 0x0A -> expects 0xF5, 0x50 -> expects 0xAF, 0x05 -> expects 0xFA.
      */
-    fun blastBromHandshakeSync(maxAttempts: Int = 10): Boolean {
+    fun blastBromHandshakeSync(maxAttempts: Int = 60): Boolean {
         val conn = usbConnection ?: return false
         val outEp = outEndpoint ?: return false
         val inEp = inEndpoint ?: return false
 
-        val syncSeq = byteArrayOf(0xA0.toByte(), 0x0A.toByte(), 0x50.toByte(), 0x05.toByte())
+        flush(15)
+
         val rxBuf = ByteArray(1)
+        val sendA0 = byteArrayOf(0xA0.toByte())
+        var syncedA0 = false
 
         for (attempt in 0 until maxAttempts) {
-            var fullMatch = true
-            for (byte in syncSeq) {
-                val singleOut = byteArrayOf(byte)
-                val w = conn.bulkTransfer(outEp, singleOut, 1, 100)
-                if (w != 1) {
-                    fullMatch = false
-                    break
-                }
+            val w = conn.bulkTransfer(outEp, sendA0, 1, 100)
+            if (w == 1) {
                 val r = conn.bulkTransfer(inEp, rxBuf, 1, 100)
-                if (r != 1) {
-                    fullMatch = false
+                if (r == 1 && rxBuf[0] == 0x5F.toByte()) {
+                    syncedA0 = true
                     break
                 }
             }
-            if (fullMatch) return true
+            try { Thread.sleep(10) } catch (_: Exception) {}
         }
-        return false
+
+        if (!syncedA0) {
+            return false
+        }
+
+        // Send 0x0A -> 0xF5
+        val send0A = byteArrayOf(0x0A.toByte())
+        if (conn.bulkTransfer(outEp, send0A, 1, 150) != 1) return false
+        if (conn.bulkTransfer(inEp, rxBuf, 1, 150) != 1 || rxBuf[0] != 0xF5.toByte()) return false
+
+        // Send 0x50 -> 0xAF
+        val send50 = byteArrayOf(0x50.toByte())
+        if (conn.bulkTransfer(outEp, send50, 1, 150) != 1) return false
+        if (conn.bulkTransfer(inEp, rxBuf, 1, 150) != 1 || rxBuf[0] != 0xAF.toByte()) return false
+
+        // Send 0x05 -> 0xFA
+        val send05 = byteArrayOf(0x05.toByte())
+        if (conn.bulkTransfer(outEp, send05, 1, 150) != 1) return false
+        if (conn.bulkTransfer(inEp, rxBuf, 1, 150) != 1 || rxBuf[0] != 0xFA.toByte()) return false
+
+        return true
     }
 
     fun getFileDescriptor(): Int {

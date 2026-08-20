@@ -108,11 +108,16 @@ class MtkBromProtocolEngine(
                 val connected = targetPhoneUsb.scanAndConnect(forceBromOnly = true)
                 if (connected) {
                     log("[+] MediaTek BROM Port DETECTED (0x0E8D)! Blasting BROM Handshake Sync...", LogLevel.SUCCESS)
-                    val synced = targetPhoneUsb.blastBromHandshakeSync(10)
+                    val synced = targetPhoneUsb.blastBromHandshakeSync(60)
                     if (synced) {
                         log("[+] BROM Handshake Sync Locked (0x5F 0xF5 0xAF 0xFA)!", LogLevel.SUCCESS)
+                        return true
+                    } else {
+                        log("[-] BROM Handshake Sync burst unacknowledged, retrying byte-by-byte...", LogLevel.WARNING)
+                        if (sendHandshakeByteByByte()) {
+                            return true
+                        }
                     }
-                    return true
                 }
                 delay(50) // Steady 50ms polling to capture BROM before device bootrom timeout
             }
@@ -212,10 +217,17 @@ class MtkBromProtocolEngine(
                 return Result.failure(IllegalStateException("HANDSHAKE FAIL: Target phone not connected via USB-OTG"))
             }
 
-            // Step 2: Read HW Code (CMD 0xA1)
-            targetPhoneUsb.writeRaw(byteArrayOf(CMD_GET_HW_CODE), 500)
-            val hwBuf = ByteArray(4)
-            val hwRead = targetPhoneUsb.readRaw(hwBuf, 500)
+            // Step 2: Read HW Code (CMD 0xA1) with retry & buffer verification
+            var hwBuf = ByteArray(4)
+            var hwRead = 0
+            for (retry in 0 until 3) {
+                targetPhoneUsb.writeRaw(byteArrayOf(CMD_GET_HW_CODE), 500)
+                hwBuf = ByteArray(4)
+                hwRead = targetPhoneUsb.readRaw(hwBuf, 1000)
+                if (hwRead >= 2) break
+                targetPhoneUsb.flush(20)
+                delay(50)
+            }
             if (hwRead <= 0) {
                 log("[-] [HARDWARE PROBE FAIL]: Failed reading SoC Hardware Code (CMD 0xA1 timeout).", LogLevel.ERROR)
                 log("[-] [PIPELINE HALTED]: Execution stopped at Hardware Probe phase.", LogLevel.ERROR)
