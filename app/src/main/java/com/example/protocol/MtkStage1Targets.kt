@@ -1,7 +1,9 @@
 package com.example.protocol
 
-// Stage1 Exploit Target Register & Hardware Architecture Definitions
-// Directly ported from mtkclient targets headers
+/**
+ * MediaTek BootROM Stage 1 Payload Target Catalog
+ * Faithfully ported from mtkclient stage1 payload header definitions (.h files)
+ */
 
 data class MtkStage1Target(
     val socName: String,
@@ -22,124 +24,133 @@ data class MtkStage1Target(
 object MtkStage1TargetCatalog {
 
     val TARGETS: Map<String, MtkStage1Target> = listOf(
+        // 1. mt2601
         MtkStage1Target(
             socName = "mt2601",
             sendUsbResponse = 0x406AC9L,
             usbdlPtr = 0x40BA68L,
             mode = 0,
-            secReg = 0x11141e80L,
+            secReg = 0x11141E80L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
-            bladdr = 0x11141f0cL,
-            bladdr2 = 0x11144bc4L,
-            uartReg0 = 0x11005014L,
-            uartReg1 = 0x11005000L,
-            cmdHandler = 0x40c5afL
-        ),
-        MtkStage1Target(
-            socName = "mt6261",
-            sendUsbResponse = 0x700016b1L,
-            usbdlPtr = 0x700058ECL,
-            mode = 0,
-            secReg = 0x700041e4L,
-            secReg2 = 0x0L,
-            secOffset = 0x0L,
-            bladdr = 0x182800C0L,
-            bladdr2 = 0x0L,
-            uartReg0 = 0xa0080014L,
-            uartReg1 = 0xa0080000L,
-            cmdHandler = 0x700061F6L
-        ),
-        MtkStage1Target(
-            socName = "mt6572",
-            sendUsbResponse = 0x406ac9L,
-            usbdlPtr = 0x40ba68L,
-            mode = 0,
-            secReg = 0x11141e80L,
-            secReg2 = 0x0L,
-            secOffset = 0x40L,
-            bladdr = 0x11141f0cL,
-            bladdr2 = 0x11144bc4L,
+            bladdr = 0x11141F0CL,
+            bladdr2 = 0x11144BC4L,
             uartReg0 = 0x11005014L,
             uartReg1 = 0x11005000L,
             cmdHandler = 0x40C5AFL
         ),
+        // 2. mt6261
         MtkStage1Target(
-            socName = "mt6575",
-            sendUsbResponse = 0xffff4e2bL,
-            usbdlPtr = 0xffffa0a0L,
+            socName = "mt6261",
+            sendUsbResponse = 0x700016B1L,
+            usbdlPtr = 0x700058ECL,
             mode = 0,
-            secReg = 0xf0002538L,
+            secReg = 0x700041E4L,
+            secReg2 = 0x0L,
+            secOffset = 0x0L,
+            bladdr = 0x182800C0L,
+            bladdr2 = 0x0L,
+            uartReg0 = 0xA0080014L,
+            uartReg1 = 0xA0080000L,
+            cmdHandler = 0x700061F6L
+        ),
+        // 3. mt6572
+        MtkStage1Target(
+            socName = "mt6572",
+            sendUsbResponse = 0x406AC9L,
+            usbdlPtr = 0x40BA68L,
+            mode = 0,
+            secReg = 0x11141E80L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
-            bladdr = 0xf00025c4L,
-            bladdr2 = 0xf00051e4L,
-            uartReg0 = 0xc1009014L,
-            uartReg1 = 0xc1009000L,
-            cmdHandler = 0xffffad5dL
+            bladdr = 0x11141F0CL,
+            bladdr2 = 0x11144BC4L,
+            uartReg0 = 0x11005014L,
+            uartReg1 = 0x11005000L,
+            cmdHandler = 0x40C5AFL
         ),
+        // 4. mt6575
+        MtkStage1Target(
+            socName = "mt6575",
+            sendUsbResponse = 0xFFFF4E2BL,
+            usbdlPtr = 0xFFFFA0A0L,
+            mode = 0,
+            secReg = 0xF0002538L,
+            secReg2 = 0x0L,
+            secOffset = 0x40L,
+            bladdr = 0xF00025C4L,
+            bladdr2 = 0xF00051E4L,
+            uartReg0 = 0xC1009014L,
+            uartReg1 = 0xC1009000L,
+            cmdHandler = 0xFFFFAD5DL
+        ),
+        // 5. mt6580
         MtkStage1Target(
             socName = "mt6580",
-            sendUsbResponse = 0x62e5L,
-            usbdlPtr = 0xb60cL,
+            sendUsbResponse = 0x62E5L,
+            usbdlPtr = 0xB60CL,
             mode = 0,
-            secReg = 0x1026d8L,
+            secReg = 0x1026D8L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x102764L,
-            bladdr2 = 0x1071d4L,
+            bladdr2 = 0x1071D4L,
             uartReg0 = 0x11005014L,
             uartReg1 = 0x11005000L,
-            cmdHandler = 0xc113L
+            cmdHandler = 0xC113L
         ),
+        // 6. mt6582
         MtkStage1Target(
             socName = "mt6582",
-            sendUsbResponse = 0x568dL,
-            usbdlPtr = 0xa5fcL,
+            sendUsbResponse = 0x568DL,
+            usbdlPtr = 0xA5FCL,
             mode = 0,
-            secReg = 0x1026fcL,
+            secReg = 0x1026FCL,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x102788L,
-            bladdr2 = 0x105be4L,
+            bladdr2 = 0x105BE4L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xb2e7L
+            cmdHandler = 0xB2E7L
         ),
+        // 7. mt6592
         MtkStage1Target(
             socName = "mt6592",
-            sendUsbResponse = 0x535dL,
-            usbdlPtr = 0xa564L,
+            sendUsbResponse = 0x535DL,
+            usbdlPtr = 0xA564L,
             mode = 0,
-            secReg = 0x1026d8L,
+            secReg = 0x1026D8L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x102764L,
-            bladdr2 = 0x105bf0L,
+            bladdr2 = 0x105BF0L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xb09fL
+            cmdHandler = 0xB09FL
         ),
+        // 8. mt6595
         MtkStage1Target(
             socName = "mt6595",
-            sendUsbResponse = 0x5e2bL,
-            usbdlPtr = 0xb218L,
+            sendUsbResponse = 0x5E2BL,
+            usbdlPtr = 0xB218L,
             mode = 0,
-            secReg = 0x1026dcL,
+            secReg = 0x1026DCL,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x102768L,
-            bladdr2 = 0x106c88L,
+            bladdr2 = 0x106C88L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xbd53L
+            cmdHandler = 0xBD53L
         ),
+        // 9. mt6735
         MtkStage1Target(
             socName = "mt6735",
             sendUsbResponse = 0x4293L,
-            usbdlPtr = 0x95f8L,
+            usbdlPtr = 0x95F8L,
             mode = 0,
-            secReg = 0x1026d4L,
+            secReg = 0x1026D4L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x102760L,
@@ -148,384 +159,412 @@ object MtkStage1TargetCatalog {
             uartReg1 = 0x11002000L,
             cmdHandler = 0xA17FL
         ),
+        // 10. mt6737
         MtkStage1Target(
             socName = "mt6737",
-            sendUsbResponse = 0x42a3L,
+            sendUsbResponse = 0x42A3L,
             usbdlPtr = 0x9608L,
             mode = 0,
-            secReg = 0x1026d4L,
+            secReg = 0x1026D4L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x102760L,
             bladdr2 = 0x105704L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xa18fL
+            cmdHandler = 0xA18FL
         ),
+        // 11. mt6739
         MtkStage1Target(
             socName = "mt6739",
-            sendUsbResponse = 0x508bL,
-            usbdlPtr = 0xdf1cL,
+            sendUsbResponse = 0x508BL,
+            usbdlPtr = 0xDF1CL,
             mode = 1,
-            secReg = 0x102a8cL,
-            secReg2 = 0x1027a8L,
+            secReg = 0x102A8CL,
+            secReg2 = 0x1027A8L,
             secOffset = 0x28L,
-            bladdr = 0x10282cL,
-            bladdr2 = 0x1076acL,
+            bladdr = 0x10282CL,
+            bladdr2 = 0x1076ACL,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xec49L
+            cmdHandler = 0xEC49L
         ),
+        // 12. mt6752
         MtkStage1Target(
             socName = "mt6752",
-            sendUsbResponse = 0x450fL,
-            usbdlPtr = 0x990cL,
+            sendUsbResponse = 0x450FL,
+            usbdlPtr = 0x990CL,
             mode = 0,
-            secReg = 0x1026d8L,
+            secReg = 0x1026D8L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x102764L,
             bladdr2 = 0x105704L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xa493L
+            cmdHandler = 0xA493L
         ),
+        // 13. mt6753
         MtkStage1Target(
             socName = "mt6753",
-            sendUsbResponse = 0x42a3L,
+            sendUsbResponse = 0x42A3L,
             usbdlPtr = 0x9668L,
             mode = 0,
-            secReg = 0x1026d4L,
+            secReg = 0x1026D4L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x102760L,
             bladdr2 = 0x105704L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xa1efL
+            cmdHandler = 0xA1EFL
         ),
+        // 14. mt6755
         MtkStage1Target(
             socName = "mt6755",
-            sendUsbResponse = 0x449fL,
-            usbdlPtr = 0x9a6cL,
+            sendUsbResponse = 0x449FL,
+            usbdlPtr = 0x9A6CL,
             mode = 0,
-            secReg = 0x1026dcL,
+            secReg = 0x1026DCL,
             secReg2 = 0x0L,
             secOffset = 0x40L,
-            bladdr = 0x10276cL,
+            bladdr = 0x10276CL,
             bladdr2 = 0x105704L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xa5ffL
+            cmdHandler = 0xA5FFL
         ),
+        // 15. mt6757
         MtkStage1Target(
             socName = "mt6757",
-            sendUsbResponse = 0x455fL,
-            usbdlPtr = 0x9c2cL,
+            sendUsbResponse = 0x455FL,
+            usbdlPtr = 0x9C2CL,
             mode = 0,
-            secReg = 0x1026e4L,
+            secReg = 0x1026E4L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x102774L,
             bladdr2 = 0x105704L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xa8fbL
+            cmdHandler = 0xA8FBL
         ),
+        // 16. mt6758
         MtkStage1Target(
             socName = "mt6758",
             sendUsbResponse = 0x4937L,
-            usbdlPtr = 0xd860L,
+            usbdlPtr = 0xD860L,
             mode = 1,
-            secReg = 0x102b8cL,
-            secReg2 = 0x1027acL,
+            secReg = 0x102B8CL,
+            secReg2 = 0x1027ACL,
             secOffset = 0x28L,
             bladdr = 0x102830L,
-            bladdr2 = 0x106a60L,
+            bladdr2 = 0x106A60L,
             uartReg0 = 0x11020014L,
             uartReg1 = 0x11020000L,
-            cmdHandler = 0xe58dL
+            cmdHandler = 0xE58DL
         ),
+        // 17. mt6761
         MtkStage1Target(
             socName = "mt6761",
-            sendUsbResponse = 0x2cdfL,
-            usbdlPtr = 0xbc8cL,
+            sendUsbResponse = 0x2CDFL,
+            usbdlPtr = 0xBC8CL,
             mode = 1,
-            secReg = 0x102a8cL,
-            secReg2 = 0x1027a4L,
+            secReg = 0x102A8CL,
+            secReg2 = 0x1027A4L,
             secOffset = 0x28L,
             bladdr = 0x102828L,
             bladdr2 = 0x105994L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xc9b9L
+            cmdHandler = 0xC9B9L
         ),
+        // 18. mt6763
         MtkStage1Target(
             socName = "mt6763",
             sendUsbResponse = 0x4877L,
-            usbdlPtr = 0xd66cL,
+            usbdlPtr = 0xD66CL,
             mode = 1,
-            secReg = 0x102b0cL,
-            secReg2 = 0x1027b0L,
+            secReg = 0x102B0CL,
+            secReg2 = 0x1027B0L,
             secOffset = 0x28L,
             bladdr = 0x102834L,
-            bladdr2 = 0x106ca4L,
+            bladdr2 = 0x106CA4L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xe383L
+            cmdHandler = 0xE383L
         ),
+        // 19. mt6765
         MtkStage1Target(
             socName = "mt6765",
-            sendUsbResponse = 0x2d2bL,
-            usbdlPtr = 0xbdc0L,
+            sendUsbResponse = 0x2D2BL,
+            usbdlPtr = 0xBDC0L,
             mode = 1,
-            secReg = 0x102a8cL,
-            secReg2 = 0x1027a4L,
+            secReg = 0x102A8CL,
+            secReg2 = 0x1027A4L,
             secOffset = 0x28L,
             bladdr = 0x102828L,
             bladdr2 = 0x105994L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xcaedL
+            cmdHandler = 0xCAEDL
         ),
+        // 20. mt6768
         MtkStage1Target(
             socName = "mt6768",
-            sendUsbResponse = 0x2c2fL,
-            usbdlPtr = 0xc190L,
+            sendUsbResponse = 0x2C2FL,
+            usbdlPtr = 0xC190L,
             mode = 1,
-            secReg = 0x102a8cL,
-            secReg2 = 0x1027a4L,
+            secReg = 0x102A8CL,
+            secReg2 = 0x1027A4L,
             secOffset = 0x28L,
-            bladdr = 0x10282cL,
+            bladdr = 0x10282CL,
             bladdr2 = 0x105994L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
             cmdHandler = 0xCF15L
         ),
+        // 21. mt6771
         MtkStage1Target(
             socName = "mt6771",
-            sendUsbResponse = 0x4dafL,
-            usbdlPtr = 0xdebcL,
+            sendUsbResponse = 0x4DAFL,
+            usbdlPtr = 0xDEBCL,
             mode = 1,
-            secReg = 0x102accL,
-            secReg2 = 0x1027b0L,
+            secReg = 0x102ACCL,
+            secReg2 = 0x1027B0L,
             secOffset = 0x28L,
             bladdr = 0x102834L,
-            bladdr2 = 0x106a60L,
+            bladdr2 = 0x106A60L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xebe9L
+            cmdHandler = 0xEBE9L
         ),
+        // 22. mt6779
         MtkStage1Target(
             socName = "mt6779",
-            sendUsbResponse = 0x4cdbL,
-            usbdlPtr = 0xe04cL,
+            sendUsbResponse = 0x4CDBL,
+            usbdlPtr = 0xE04CL,
             mode = 1,
-            secReg = 0x102accL,
-            secReg2 = 0x1027b0L,
+            secReg = 0x102ACCL,
+            secReg2 = 0x1027B0L,
             secOffset = 0x28L,
             bladdr = 0x102838L,
-            bladdr2 = 0x106a60L,
+            bladdr2 = 0x106A60L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xed6dL
+            cmdHandler = 0xED6DL
         ),
+        // 23. mt6781 (socName = "brom_1")
         MtkStage1Target(
-            socName = "mt6781",
-            sendUsbResponse = 0x4aa7L,
-            usbdlPtr = 0xe5d8L,
+            socName = "brom_1",
+            sendUsbResponse = 0x4AA7L,
+            usbdlPtr = 0xE5D8L,
             mode = 1,
-            secReg = 0x102b0cL,
+            secReg = 0x102B0CL,
             secReg2 = 0x1027BCL,
             secOffset = 0x28L,
-            bladdr = 0x10284cL,
-            bladdr2 = 0x106b54L,
+            bladdr = 0x10284CL,
+            bladdr2 = 0x106B54L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xf3c1L
+            cmdHandler = 0xF3C1L
         ),
+        // 24. mt6785
         MtkStage1Target(
             socName = "mt6785",
-            sendUsbResponse = 0x4c8fL,
-            usbdlPtr = 0xe2a4L,
+            sendUsbResponse = 0x4C8FL,
+            usbdlPtr = 0xE2A4L,
             mode = 1,
-            secReg = 0x102accL,
-            secReg2 = 0x1027b0L,
+            secReg = 0x102ACCL,
+            secReg2 = 0x1027B0L,
             secOffset = 0x28L,
             bladdr = 0x102838L,
-            bladdr2 = 0x106a60L,
+            bladdr2 = 0x106A60L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
             cmdHandler = 0xF029L
         ),
+        // 25. mt6795
         MtkStage1Target(
             socName = "mt6795",
             sendUsbResponse = 0x4347L,
-            usbdlPtr = 0x978cL,
+            usbdlPtr = 0x978CL,
             mode = 0,
-            secReg = 0x1026d8L,
+            secReg = 0x1026D8L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x102764L,
             bladdr2 = 0x105704L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xa313L
+            cmdHandler = 0xA313L
         ),
+        // 26. mt6797
         MtkStage1Target(
             socName = "mt6797",
             sendUsbResponse = 0x4807L,
-            usbdlPtr = 0x9eacL,
+            usbdlPtr = 0x9EACL,
             mode = 0,
-            secReg = 0x1026dcL,
+            secReg = 0x1026DCL,
             secReg2 = 0x0L,
             secOffset = 0x40L,
-            bladdr = 0x10276cL,
+            bladdr = 0x10276CL,
             bladdr2 = 0x105704L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xaa3fL
+            cmdHandler = 0xAA3FL
         ),
+        // 27. mt6799
         MtkStage1Target(
             socName = "mt6799",
-            sendUsbResponse = 0x66afL,
-            usbdlPtr = 0xf5acL,
+            sendUsbResponse = 0x66AFL,
+            usbdlPtr = 0xF5ACL,
             mode = 1,
-            secReg = 0x10334cL,
-            secReg2 = 0x1027ecL,
+            secReg = 0x10334CL,
+            secReg2 = 0x1027ECL,
             secOffset = 0x28L,
             bladdr = 0x102870L,
             bladdr2 = 0x107070L,
             uartReg0 = 0x11020014L,
             uartReg1 = 0x11020000L,
-            cmdHandler = 0x102c3L
+            cmdHandler = 0x102C3L
         ),
+        // 28. mt6833
         MtkStage1Target(
             socName = "mt6833",
-            sendUsbResponse = 0x48f3L,
-            usbdlPtr = 0xdfe0L,
+            sendUsbResponse = 0x48F3L,
+            usbdlPtr = 0xDFE0L,
             mode = 1,
-            secReg = 0x102b0cL,
-            secReg2 = 0x1027bcL,
+            secReg = 0x102B0CL,
+            secReg2 = 0x1027BCL,
             secOffset = 0x28L,
             bladdr = 0x102844L,
-            bladdr2 = 0x106b54L,
+            bladdr2 = 0x106B54L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xedadL
+            cmdHandler = 0xEDADL
         ),
+        // 29. mt6853
         MtkStage1Target(
             socName = "mt6853",
-            sendUsbResponse = 0x538fL,
-            usbdlPtr = 0xea64L,
+            sendUsbResponse = 0x538FL,
+            usbdlPtr = 0xEA64L,
             mode = 1,
-            secReg = 0x102b0cL,
-            secReg2 = 0x1027c4L,
+            secReg = 0x102B0CL,
+            secReg2 = 0x1027C4L,
             secOffset = 0x28L,
-            bladdr = 0x10284cL,
-            bladdr2 = 0x106b60L,
+            bladdr = 0x10284CL,
+            bladdr2 = 0x106B60L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xf831L
+            cmdHandler = 0xF831L
         ),
+        // 30. mt6873
         MtkStage1Target(
             socName = "mt6873",
-            sendUsbResponse = 0x53afL,
-            usbdlPtr = 0xea78L,
+            sendUsbResponse = 0x53AFL,
+            usbdlPtr = 0xEA78L,
             mode = 1,
-            secReg = 0x102b0cL,
-            secReg2 = 0x1027c4L,
+            secReg = 0x102B0CL,
+            secReg2 = 0x1027C4L,
             secOffset = 0x28L,
-            bladdr = 0x10284cL,
-            bladdr2 = 0x106b60L,
+            bladdr = 0x10284CL,
+            bladdr2 = 0x106B60L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xf7fdL
+            cmdHandler = 0xF7FDL
         ),
+        // 31. mt6877
         MtkStage1Target(
             socName = "mt6877",
             sendUsbResponse = 0x5187L,
-            usbdlPtr = 0xe8d0L,
+            usbdlPtr = 0xE8D0L,
             mode = 1,
-            secReg = 0x102b0cL,
-            secReg2 = 0x1027c0L,
+            secReg = 0x102B0CL,
+            secReg2 = 0x1027C0L,
             secOffset = 0x28L,
             bladdr = 0x102848L,
-            bladdr2 = 0x106b60L,
+            bladdr2 = 0x106B60L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xf69dL
+            cmdHandler = 0xF69DL
         ),
+        // 32. mt6885
         MtkStage1Target(
             socName = "mt6885",
-            sendUsbResponse = 0x505bL,
-            usbdlPtr = 0xe6fcL,
+            sendUsbResponse = 0x505BL,
+            usbdlPtr = 0xE6FCL,
             mode = 1,
-            secReg = 0x102b0cL,
-            secReg2 = 0x1027c0L,
+            secReg = 0x102B0CL,
+            secReg2 = 0x1027C0L,
             secOffset = 0x28L,
             bladdr = 0x102848L,
-            bladdr2 = 0x106b60L,
+            bladdr2 = 0x106B60L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
             cmdHandler = 0xF481L
         ),
+        // 33. mt6893
         MtkStage1Target(
             socName = "mt6893",
-            sendUsbResponse = 0x501fL,
-            usbdlPtr = 0xe79cL,
+            sendUsbResponse = 0x501FL,
+            usbdlPtr = 0xE79CL,
             mode = 1,
-            secReg = 0x102b0cL,
-            secReg2 = 0x1027c0L,
+            secReg = 0x102B0CL,
+            secReg2 = 0x1027C0L,
             secOffset = 0x28L,
             bladdr = 0x102848L,
-            bladdr2 = 0x106b60L,
+            bladdr2 = 0x106B60L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xf569L
+            cmdHandler = 0xF569L
         ),
+        // 34. mt8127
         MtkStage1Target(
             socName = "mt8127",
-            sendUsbResponse = 0x62a1L,
-            usbdlPtr = 0xb2b8L,
+            sendUsbResponse = 0x62A1L,
+            usbdlPtr = 0xB2B8L,
             mode = 0,
-            secReg = 0x1027e4L,
+            secReg = 0x1027E4L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x102870L,
-            bladdr2 = 0x106c7cL,
+            bladdr2 = 0x106C7CL,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xbdf3L
+            cmdHandler = 0xBDF3L
         ),
+        // 35. mt8163
         MtkStage1Target(
             socName = "mt8163",
-            sendUsbResponse = 0x6d6fL,
-            usbdlPtr = 0xc12cL,
+            sendUsbResponse = 0x6D6FL,
+            usbdlPtr = 0xC12CL,
             mode = 0,
-            secReg = 0x1027dcL,
+            secReg = 0x1027DCL,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x102868L,
-            bladdr2 = 0x1072dcL,
+            bladdr2 = 0x1072DCL,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xccb3L
+            cmdHandler = 0xCCB3L
         ),
+        // 36. mt8167
         MtkStage1Target(
             socName = "mt8167",
-            sendUsbResponse = 0x6c7dL,
-            usbdlPtr = 0xd2e4L,
+            sendUsbResponse = 0x6C7DL,
+            usbdlPtr = 0xD2E4L,
             mode = 1,
-            secReg = 0x10340cL,
-            secReg2 = 0x1028e4L,
+            secReg = 0x10340CL,
+            secReg2 = 0x1028E4L,
             secOffset = 0x28L,
             bladdr = 0x102968L,
             bladdr2 = 0x107954L,
             uartReg0 = 0x11005014L,
             uartReg1 = 0x11005000L,
-            cmdHandler = 0xdff7L
+            cmdHandler = 0xDFF7L
         ),
+        // 37. mt8168
         MtkStage1Target(
             socName = "mt8168",
             sendUsbResponse = 0xD0F3L,
@@ -540,34 +579,37 @@ object MtkStage1TargetCatalog {
             uartReg1 = 0x11002000L,
             cmdHandler = 0x1436FL
         ),
+        // 38. mt8173
         MtkStage1Target(
             socName = "mt8173",
-            sendUsbResponse = 0x4c5fL,
-            usbdlPtr = 0xa0e4L,
+            sendUsbResponse = 0x4C5FL,
+            usbdlPtr = 0xA0E4L,
             mode = 0,
-            secReg = 0x1226e8L,
+            secReg = 0x1226E8L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x122774L,
             bladdr2 = 0x125904L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xac6bL
+            cmdHandler = 0xAC6BL
         ),
+        // 39. mt8176
         MtkStage1Target(
             socName = "mt8176",
-            sendUsbResponse = 0x4c5fL,
-            usbdlPtr = 0xa0e4L,
+            sendUsbResponse = 0x4C5FL,
+            usbdlPtr = 0xA0E4L,
             mode = 0,
-            secReg = 0x1226e8L,
+            secReg = 0x1226E8L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x122774L,
             bladdr2 = 0x125904L,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xac6bL
+            cmdHandler = 0xAC6BL
         ),
+        // 40. mt8512
         MtkStage1Target(
             socName = "mt8512",
             sendUsbResponse = 0x6697L,
@@ -582,33 +624,35 @@ object MtkStage1TargetCatalog {
             uartReg1 = 0x11002000L,
             cmdHandler = 0xD7ABL
         ),
+        // 41. mt8590
         MtkStage1Target(
             socName = "mt8590",
-            sendUsbResponse = 0x6bc9L,
-            usbdlPtr = 0xbbe4L,
+            sendUsbResponse = 0x6BC9L,
+            usbdlPtr = 0xBBE4L,
             mode = 0,
-            secReg = 0x1027e4L,
+            secReg = 0x1027E4L,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x102870L,
-            bladdr2 = 0x106c7cL,
+            bladdr2 = 0x106C7CL,
             uartReg0 = 0x11002014L,
             uartReg1 = 0x11002000L,
-            cmdHandler = 0xc71fL
+            cmdHandler = 0xC71FL
         ),
+        // 42. mt8695
         MtkStage1Target(
             socName = "mt8695",
-            sendUsbResponse = 0x55bbL,
-            usbdlPtr = 0xbeecL,
+            sendUsbResponse = 0x55BBL,
+            usbdlPtr = 0xBEECL,
             mode = 0,
-            secReg = 0x102fbcL,
+            secReg = 0x102FBCL,
             secReg2 = 0x0L,
             secOffset = 0x40L,
             bladdr = 0x103048L,
-            bladdr2 = 0x106ec4L,
+            bladdr2 = 0x106EC4L,
             uartReg0 = 0x11003014L,
             uartReg1 = 0x11003000L,
-            cmdHandler = 0xcaa7L
+            cmdHandler = 0xCAA7L
         )
     ).associateBy { it.socName.lowercase() }
 
@@ -619,65 +663,3 @@ object MtkStage1TargetCatalog {
 
     fun getAllSocNames(): List<String> = TARGETS.keys.toList()
 }
-
-/**
- * Direct BROM Function Pointers & Memory Offsets (br Dictionary from mtkclient)
- * Used for Direct Low-Level USB DL Put/Get Memory Injections and Watchdog Control
- */
-data class MtkBromOffsets(
-    val filename: String,
-    val sendUsbResponse: Long,
-    val usbdlPutData: Long,
-    val usbdlGetData: Long,
-    val secReg: Long,
-    val secReg2: Long,
-    val wdt: Long,
-    val uartReg1: Long,
-    val bromBase: Long
-)
-
-object MtkBromOffsetsCatalog {
-
-    val OFFSETS: Map<String, MtkBromOffsets> = listOf(
-        MtkBromOffsets("mt6580.bin", 0x62E5L, 0xB5EFL, 0xB569L, 0x1026D8L, 0x0L, 0x10007000L, 0x11005000L, 0x0L),
-        MtkBromOffsets("mt6572.bin", 0x6AC9L, 0xBA4BL, 0xB9C5L, 0x11141E80L, 0x0L, 0x10007000L, 0x11005000L, 0x400000L),
-        MtkBromOffsets("mt6582_6582.bin", 0x568DL, 0xA5DFL, 0xA559L, 0x1026FCL, 0x0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6592_6592.bin", 0x535DL, 0xA547L, 0xA4C1L, 0x1026d8L, 0x0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6595_6595.bin", 0x5E2BL, 0xB1FBL, 0xB175L, 0x1026DCL, 0x0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6735.bin", 0x4293L, 0x95DBL, 0x9555L, 0x1026D4L, 0x0L, 0x10212000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6737_335.bin", 0x42a3L, 0x95ebL, 0x9565L, 0x1026D4L, 0x0L, 0x10212000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6739_699.bin", 0x508BL, 0xDEFFL, 0xDE71L, 0x102A8CL, 0x1027A8L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6753_337.bin", 0x42A3L, 0x964BL, 0x95C5L, 0x1026D4L, 0x0L, 0x10211000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6755_326.bin", 0x449fL, 0x9a4fL, 0x99c9L, 0x1026DCL, 0x0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6757_551.bin", 0x455fL, 0x9C0FL, 0x9B89L, 0x1026E4L, 0x0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6758_688.bin", 0x4937L, 0xd843L, 0xd7bdL, 0x102B8CL, 0x1027acL, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6761_717.bin", 0x2CDFL, 0xBC6FL, 0xBBE1L, 0x102a8cL, 0x1027A4L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6763_690.bin", 0x4877L, 0xD64FL, 0xD5C9L, 0x102B0CL, 0x1027B0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6765_766.bin", 0x2D2BL, 0xBDA3L, 0xBD15L, 0x102a8cL, 0x1027A4L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6768_707.bin", 0x2c2fL, 0xc173L, 0xc0e5L, 0x102A8cL, 0x1027A4L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6771_788.bin", 0x4DAFL, 0xDE9FL, 0xDE11L, 0x102accL, 0x1027B0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6779_725.bin", 0x4CDBL, 0xE02FL, 0xDFA1L, 0x102ACCL, 0x1027B0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6781_1066.bin", 0x4AA7L, 0xE5BBL, 0xE52DL, 0x102B0CL, 0x1027BCL, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6785_813.bin", 0x4C8FL, 0xe287L, 0xe1f9L, 0x102accL, 0x1027B0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6795_6795.bin", 0x4347L, 0x976FL, 0x96E9L, 0x1026D8L, 0x0L, 0x10007000L, 0x11020000L, 0x0L),
-        MtkBromOffsets("mt6797_279.bin", 0x4807L, 0x9e8fL, 0x9e09L, 0x0L, 0x1026DCL, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6799_562.bin", 0x66AFL, 0xF58FL, 0xF509L, 0x10334CL, 0x1027ECL, 0x10211000L, 0x11020000L, 0x0L),
-        MtkBromOffsets("mt6833_989.bin", 0x48F3L, 0xDFC3L, 0xDF35L, 0x102B0CL, 0x1027BCL, 0x10211000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6853_996.bin", 0x538FL, 0xEA47L, 0xE9B9L, 0x102b0cL, 0x1027C4L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6873_886.bin", 0x53afL, 0xea5bL, 0xe9cdL, 0x102b0cL, 0x1027C4L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6877_886.bin", 0x5187L, 0xE8B3L, 0xE825L, 0x102b0cL, 0x1027c0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt6885_816.bin", 0x505BL, 0xE6DFL, 0xE651L, 0x102B0CL, 0x1027C0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt8173_8172.bin", 0x4c5fL, 0xa0c7L, 0xa041L, 0x1226e8L, 0x0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt8163.bin", 0x6d6fL, 0xc10fL, 0xc089L, 0x1027dcL, 0x0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt8127.bin", 0x62a1L, 0xb29bL, 0xb215L, 0x1027e4L, 0x0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt8167_8167.bin", 0x6C7DL, 0xD2C7L, 0xD241L, 0x10340CL, 0x1028E4L, 0x10007000L, 0x11005000L, 0x0L),
-        MtkBromOffsets("mt8590_mt8521_mt7623_8590.bin", 0x6bc9L, 0xbbc7L, 0xbb41L, 0x1027E4L, 0x0L, 0x10007000L, 0x11002000L, 0x0L),
-        MtkBromOffsets("mt8695.bin", 0x55bbL, 0xbed1L, 0xbe4bL, 0x102FBCL, 0x0L, 0x10007000L, 0x11003000L, 0x0L)
-    ).associateBy { it.filename.substringBefore(".").substringBefore("_").lowercase() }
-
-    fun findBromOffsets(chipCode: String): MtkBromOffsets? {
-        val clean = chipCode.lowercase().replace("mt", "").replace("helio", "").trim()
-        return OFFSETS["mt$clean"] ?: OFFSETS[chipCode.lowercase()]
-    }
-}
-

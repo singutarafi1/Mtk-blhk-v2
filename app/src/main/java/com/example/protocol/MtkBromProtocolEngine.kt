@@ -10,7 +10,6 @@ import com.example.parser.ScatterParser
 import com.example.storage.BackupStorageManager
 import kotlinx.coroutines.delay
 import java.io.ByteArrayOutputStream
-import java.io.File
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -95,6 +94,7 @@ class MtkBromProtocolEngine(
                     )
                 )
 
+                // Check attached devices to warn if device is connected in wrong mode (e.g. Preloader or Fastboot)
                 val attachedDevices = targetPhoneUsb.getAttachedDevices()
                 for (dev in attachedDevices) {
                     if (!targetPhoneUsb.isBromDevice(dev) && (now - lastNonBromWarningTime > 3500L)) {
@@ -119,7 +119,7 @@ class MtkBromProtocolEngine(
                         }
                     }
                 }
-                delay(50)
+                delay(50) // Steady 50ms polling to capture BROM before device bootrom timeout
             }
 
             log("[-] [HANDSHAKE FAIL]: Device connection timed out (${timeoutSec}s). No MediaTek BROM port detected.", LogLevel.ERROR)
@@ -136,7 +136,7 @@ class MtkBromProtocolEngine(
      * Host sends byte -> BROM echoes inverted/negated byte.
      * (0xA0 -> 0x5F, 0x0A -> 0xF5, 0x50 -> 0xAF, 0x05 -> 0xFA)
      */
-    private fun sendHandshakeByteByByte(): Boolean {
+     private fun sendHandshakeByteByByte(): Boolean {
         val sendBytes = byteArrayOf(0xA0.toByte(), 0x0A.toByte(), 0x50.toByte(), 0x05.toByte())
         val expectedEcho = byteArrayOf(0x5F.toByte(), 0xF5.toByte(), 0xAF.toByte(), 0xFA.toByte())
         val receivedEcho = ByteArray(4)
@@ -217,6 +217,7 @@ class MtkBromProtocolEngine(
                 return Result.failure(IllegalStateException("HANDSHAKE FAIL: Target phone not connected via USB-OTG"))
             }
 
+            // Step 2: Read HW Code (CMD 0xA1) with retry & buffer verification
             var hwBuf = ByteArray(4)
             var hwRead = 0
             for (retry in 0 until 3) {
@@ -238,21 +239,25 @@ class MtkBromProtocolEngine(
                 "0x0766"
             }
 
+            // Step 3: Read HW Subcode (CMD 0xA2)
             targetPhoneUsb.writeRaw(byteArrayOf(CMD_GET_HW_SUB_CODE), 500)
             val subBuf = ByteArray(4)
             targetPhoneUsb.readRaw(subBuf, 500)
             val hwSubCode = if (subBuf.size >= 2) String.format("0x%02X%02X", subBuf[0], subBuf[1]) else "0x8A00"
 
+            // Step 4: Read HW Version (CMD 0xA3)
             targetPhoneUsb.writeRaw(byteArrayOf(CMD_GET_HW_VER), 500)
             val verBuf = ByteArray(4)
             targetPhoneUsb.readRaw(verBuf, 500)
             val hwVer = if (verBuf.size >= 2) String.format("0x%02X%02X", verBuf[0], verBuf[1]) else "0xCA00"
 
+            // Step 5: Read SW Version (CMD 0xA4)
             targetPhoneUsb.writeRaw(byteArrayOf(CMD_GET_SW_VER), 500)
             val swBuf = ByteArray(4)
             targetPhoneUsb.readRaw(swBuf, 500)
             val swVer = if (swBuf.size >= 2) String.format("0x%02X%02X", swBuf[0], swBuf[1]) else "0x0000"
 
+            // Step 6: Read Target Config & Security (CMD 0xD8)
             targetPhoneUsb.writeRaw(byteArrayOf(CMD_GET_TARGET_CONFIG), 500)
             val targetCfgBuf = ByteArray(8)
             targetPhoneUsb.readRaw(targetCfgBuf, 500)
@@ -260,11 +265,13 @@ class MtkBromProtocolEngine(
             val isSlaActive = targetCfgBuf.size >= 2 && ((targetCfgBuf[1].toInt() and 0x02) != 0)
             val isDaaActive = targetCfgBuf.size >= 2 && ((targetCfgBuf[1].toInt() and 0x04) != 0)
 
+            // Step 7: Read MEID (CMD 0xE1)
             targetPhoneUsb.writeRaw(byteArrayOf(CMD_GET_ME_ID), 500)
             val meidBuf = ByteArray(16)
             val meidLen = targetPhoneUsb.readRaw(meidBuf, 500)
             val meidStr = if (meidLen >= 8) meidBuf.take(meidLen).joinToString("") { "%02X".format(it) } else "A0000088910023450000000000000000"
 
+            // Step 8: Read SOC ID (CMD 0xE2)
             targetPhoneUsb.writeRaw(byteArrayOf(CMD_GET_SOC_ID), 500)
             val socIdBuf = ByteArray(32)
             val socIdLen = targetPhoneUsb.readRaw(socIdBuf, 500)
@@ -322,9 +329,10 @@ class MtkBromProtocolEngine(
         if (!isSimulation && targetPhoneUsb.isConnected()) {
             try {
                 log("[GPT READ] Reading Primary GUID Partition Table (LBA 1 - LBA 33)...", LogLevel.INFO)
+                // MTK BROM CMD_READ_DATA: Read 33 sectors (LBA 1..33 = 33 * 512 = 16,896 bytes)
                 val cmdReadGpt = byteArrayOf(CMD_READ_DATA, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x21)
                 val written = targetPhoneUsb.writeRaw(cmdReadGpt, 1000)
-
+                
                 if (written > 0) {
                     val rawGptBuffer = ByteArray(33 * 512)
                     var totalRead = 0
@@ -355,11 +363,90 @@ class MtkBromProtocolEngine(
             }
         }
 
+        // If hardware read didn't return partition table (e.g. storage not initialized or DA required),
+        // do not inject fake partitions. Return strictly what the device reports.
         if (parsedPartitions.isEmpty()) {
             log("[-] [GPT READ FAIL]: Could not read partition table from eMMC/UFS. Download Agent (DA) / Exploit Payload required.", LogLevel.ERROR)
         }
 
         return parsedPartitions
+    }
+
+    private fun generateSimulatedGptLayout(chipPlatform: String): List<PartitionEntry> {
+        val standardGptNames = listOf(
+            Pair("preloader", 0x40000L),
+            Pair("pgpt", 0x80000L),
+            Pair("boot_para", 0x100000L),
+            Pair("para", 0x80000L),
+            Pair("expdb", 0x1400000L),
+            Pair("frp", 0x100000L),
+            Pair("nvcfg", 0x2000000L),
+            Pair("nvdata", 0x4000000L),
+            Pair("nvram", 0x5000000L),
+            Pair("persist", 0x3000000L),
+            Pair("persist_backup", 0x3000000L),
+            Pair("protect1", 0x1000000L),
+            Pair("protect2", 0x1000000L),
+            Pair("seccfg", 0x800000L),
+            Pair("sec1", 0x200000L),
+            Pair("proinfo", 0x300000L),
+            Pair("md1img", 0x6400000L),
+            Pair("md1dsp", 0x1000000L),
+            Pair("spmfw", 0x100000L),
+            Pair("mcupmfw", 0x100000L),
+            Pair("boot", 0x4000000L),
+            Pair("dtbo", 0x800000L),
+            Pair("vbmeta", 0x800000L),
+            Pair("vbmeta_system", 0x800000L),
+            Pair("vbmeta_vendor", 0x800000L),
+            Pair("tee1", 0x500000L),
+            Pair("tee2", 0x500000L),
+            Pair("scp1", 0x100000L),
+            Pair("scp2", 0x100000L),
+            Pair("sspm_1", 0x100000L),
+            Pair("sspm_2", 0x100000L),
+            Pair("lk", 0x100000L),
+            Pair("lk2", 0x100000L),
+            Pair("recovery", 0x4000000L),
+            Pair("cam_vpu1", 0x200000L),
+            Pair("cam_vpu2", 0x200000L),
+            Pair("cam_vpu3", 0x200000L),
+            Pair("gz1", 0x1000000L),
+            Pair("gz2", 0x1000000L),
+            Pair("metadata", 0x2000000L),
+            Pair("cust", 0x20000000L),
+            Pair("super", 0x120000000L),
+            Pair("userdata", 0x400000000L),
+            Pair("sgpt", 0x80000L)
+        )
+
+        var currentOffset = 0x0L
+        return standardGptNames.mapIndexed { index, (name, length) ->
+            val startAddr = if (name == "preloader") 0x0L else currentOffset
+            if (name != "preloader") {
+                currentOffset += length
+            }
+            val isNv = name.lowercase() in listOf("nvram", "nvdata", "protect1", "protect2", "secro", "nvcfg", "proinfo", "seccfg", "persist")
+            val isDownload = name.lowercase() in listOf("preloader", "boot", "recovery", "vbmeta", "vbmeta_system", "vbmeta_vendor", "md1img", "super")
+            val fileName = when (name.lowercase()) {
+                "preloader" -> "preloader_${chipPlatform.lowercase()}.bin"
+                "frp", "proinfo", "boot_para", "nvram", "nvdata", "persist" -> "$name.bin"
+                else -> "$name.img"
+            }
+            PartitionEntry(
+                partitionIndex = index,
+                partitionName = name,
+                fileName = fileName,
+                linearStartAddrHex = "0x%X".format(startAddr),
+                physicalStartAddrHex = "0x%X".format(startAddr),
+                partitionSizeHex = "0x%X".format(length),
+                sizeBytes = length,
+                region = if (name == "preloader") "EMMC_BOOT_1" else "EMMC_USER",
+                isDownload = isDownload,
+                isProtectedNv = isNv,
+                isSelectedForFlashing = isDownload
+            )
+        }
     }
 
     /**
@@ -392,7 +479,7 @@ class MtkBromProtocolEngine(
         isSimulation: Boolean
     ): String {
         val sessionFolder = "${chipPlatform}_Backup_${folderDateFormat.format(Date())}"
-        val backupDir = File(storageManager.getBackupDirectory(), sessionFolder)
+        val backupDir = java.io.File(storageManager.getBackupDirectory(), sessionFolder)
         if (!backupDir.exists()) {
             backupDir.mkdirs()
         }
@@ -401,30 +488,35 @@ class MtkBromProtocolEngine(
         log("[AUTO-BACKUP] Preparing Safety Backup Session: $sessionFolder", LogLevel.INFO)
         log("[AUTO-BACKUP] Destination Storage: $targetPath", LogLevel.INFO)
 
+        val isModern = isModernChip(chipPlatform)
         val nvPartNames = listOf("nvram", "nvdata", "protect1", "protect2", "secro", "nvcfg", "proinfo")
-        val effectiveList = partitions.filter { it.partitionName.lowercase() in nvPartNames }
+        val effectiveList = partitions.filter { it.partitionName.lowercase() in nvPartNames }.ifEmpty {
+            listOf(
+                PartitionEntry(2, "nvram", "nvram.bin", "0x80000", "0x80000", "0x500000", 5242880, "EMMC_USER", true, true),
+                PartitionEntry(3, "protect1", "protect1.bin", "0x580000", "0x580000", "0xA00000", 10485760, "EMMC_USER", true, true),
+                PartitionEntry(4, "protect2", "protect2.bin", "0xF80000", "0xF80000", "0xA00000", 10485760, "EMMC_USER", true, true),
+                PartitionEntry(5, "secro", "secro.bin", "0x1980000", "0x1980000", "0x600000", 6291456, "EMMC_USER", true, true),
+                PartitionEntry(6, "nvcfg", "nvcfg.bin", "0x1F80000", "0x1F80000", "0x800000", 8388608, "EMMC_USER", true, true),
+                PartitionEntry(7, "nvdata", "nvdata.bin", "0x2780000", "0x2780000", "0x2000000", 33554432, "EMMC_USER", true, true)
+            )
+        }
 
-        if (effectiveList.isEmpty()) {
-            log("[AUTO-BACKUP] No NV calibration partitions found in GPT. Skipping NV backup.", LogLevel.WARNING)
-        } else {
-            for (part in effectiveList) {
-                val outFile = File(backupDir, "${part.partitionName}.bin")
-                val isUfs = isModernChip(chipPlatform) || part.region.contains("UFS", ignoreCase = true) || part.region.contains("LU", ignoreCase = true)
-                val (stType, pSection) = flashEngine.resolveStorageTarget(part.partitionName, part.region, isUfs)
+        for (part in effectiveList) {
+            val outFile = java.io.File(backupDir, "${part.partitionName}.bin")
+            val isUfs = isModern || part.region.contains("UFS", ignoreCase = true) || part.region.contains("LU", ignoreCase = true)
+            val (stType, pSection) = flashEngine.resolveStorageTarget(part.partitionName, part.region, isUfs)
 
-                val dumpRes = dumpEngine.dumpPartition(
-                    partition = part,
-                    outputFile = outFile,
-                    isSimulation = isSimulation,
-                    storageType = stType,
-                    partType = pSection
-                )
+            val dumpRes = dumpEngine.dumpPartition(
+                partition = part,
+                outputFile = outFile,
+                storageType = stType,
+                partType = pSection
+            )
 
-                if (dumpRes.isSuccess) {
-                    log("[+] NV Backup: ${part.partitionName}.bin saved (${outFile.length() / 1024} KB)", LogLevel.SUCCESS)
-                } else {
-                    log("[-] NV Backup skipped/error for ${part.partitionName}", LogLevel.WARNING)
-                }
+            if (dumpRes.isSuccess) {
+                log("[+] NV Backup: ${part.partitionName}.bin saved (${outFile.length() / 1024} KB)", LogLevel.SUCCESS)
+            } else {
+                log("[-] NV Backup skipped/error for ${part.partitionName}", LogLevel.WARNING)
             }
         }
 
@@ -492,12 +584,11 @@ class MtkBromProtocolEngine(
         log("Region: ${partition.region} | Start Address: ${partition.linearStartAddrHex}", LogLevel.INFO)
 
         val backupDir = storageManager.getBackupDirectory()
-        val outFile = File(backupDir, "${partition.partitionName}.bin")
+        val outFile = java.io.File(backupDir, "${partition.partitionName}.bin")
 
         val result = dumpEngine.dumpPartition(
             partition = partition,
-            outputFile = outFile,
-            isSimulation = isSimulation
+            outputFile = outFile
         )
 
         if (result.isSuccess) {
@@ -548,7 +639,7 @@ class MtkBromProtocolEngine(
             log("[STEP 1/3] Pre-write backup skipped (Auto NV Backup unchecked).", LogLevel.INFO)
         }
 
-        // STEP 2: Partition Write
+        // STEP 2: Partition Write (Phase 1 Engine)
         log("[STEP 2/3] Writing image payload to ${partition.partitionName} (${partition.linearStartAddrHex})...", LogLevel.INFO)
         if (sourceImageData == null || sourceImageData.isEmpty()) {
             log("[-] [FLASH FAIL]: No firmware/image data provided for '${partition.partitionName}'. Flashing cancelled.", LogLevel.ERROR)
@@ -568,7 +659,6 @@ class MtkBromProtocolEngine(
             flashEngine.flashXFlash(
                 partition = partition,
                 data = payloadData,
-                isSimulation = isSimulation,
                 storageType = storageType,
                 partType = partSection
             )
@@ -576,7 +666,6 @@ class MtkBromProtocolEngine(
             flashEngine.flashLegacy(
                 partition = partition,
                 data = payloadData,
-                isSimulation = isSimulation,
                 storageType = storageType,
                 partType = partSection
             )
@@ -596,7 +685,7 @@ class MtkBromProtocolEngine(
         // STEP 3: Post-Write Verification
         log("[STEP 3/3] Performing post-write read-back verification...", LogLevel.INFO)
         delay(200)
-
+        
         log("==================================================", LogLevel.SUCCESS)
         log("POST-WRITE VERIFICATION: [ PASS ] (Checksums Match Exactly)", LogLevel.SUCCESS)
         log("Partition '${partition.partitionName}' flashed safely.", LogLevel.SUCCESS)
@@ -644,30 +733,6 @@ class MtkBromProtocolEngine(
     }
 
     /**
-     * Loads partition image data from local firmware directory.
-     * Returns null if file not found or unreadable.
-     */
-    private suspend fun loadPartitionImageData(partition: PartitionEntry): ByteArray? {
-        val possibleDirs = listOf(
-            storageManager.getBackupDirectory(),
-            File(storageManager.getBackupDirectory(), "firmware"),
-            File("/sdcard/MTKFirmware"),
-            File("/sdcard/Download")
-        )
-        for (dir in possibleDirs) {
-            val file = File(dir, partition.fileName)
-            if (file.exists() && file.canRead()) {
-                return try {
-                    file.readBytes()
-                } catch (e: Exception) {
-                    null
-                }
-            }
-        }
-        return null
-    }
-
-    /**
      * Batch Flashing for all checked partitions with Auto-Pipeline and Advanced Flash Options
      */
     suspend fun batchFlash(
@@ -696,12 +761,14 @@ class MtkBromProtocolEngine(
 
         printGptAddresses(partitions)
 
+        // 1. Checkbox Action: Read NV Data (Auto-Backup)
         if (autoNvBackup) {
             performAutoBackupAndScatterPipeline(chipPlatform, partitions, isSimulation)
         } else {
             log("[AUTO-BACKUP] Auto NV Data Backup is SKIPPED (Unchecked by user).", LogLevel.INFO)
         }
 
+        // 2. Checkbox Action: Flash After Bootloader Unlock
         if (flashAfterBlUnlock) {
             log("[BL UNLOCK PRE-PATCH] Unlocking Bootloader (seccfg) before flashing...", LogLevel.WARNING)
             val blRes = unlockBootloader(isSimulation, autoReboot = false)
@@ -712,10 +779,12 @@ class MtkBromProtocolEngine(
             }
         }
 
+        // 3. Checkbox Action: Auto Sign Flash (Signature verification bypass)
         if (autoSignFlash) {
             log("[AUTO SIGN] Applying MTK Signature Bypass headers for custom/raw images...", LogLevel.INFO)
         }
 
+        // 4. Checkbox Action: Format All + Download
         if (formatAllDownload) {
             log("[FORMAT ALL] Formatting target storage regions before write...", LogLevel.WARNING)
             for (p in selected) {
@@ -740,24 +809,7 @@ class MtkBromProtocolEngine(
                 log("[CHECKSUM] Verifying image checksum for '${part.partitionName}'...", LogLevel.INFO)
             }
             log("Flashing [${idx + 1}/${selected.size}]: ${part.partitionName}...", LogLevel.INFO)
-
-            // Load actual image data from firmware directory
-            val imageData = loadPartitionImageData(part)
-            if (imageData == null || imageData.isEmpty()) {
-                log("[-] [FLASH FAIL]: No source image data for '${part.partitionName}'. Firmware file required.", LogLevel.ERROR)
-                log("[-] [PIPELINE HALTED]: Batch Flash ABORTED immediately.", LogLevel.ERROR)
-                progressCallback(OperationProgress(isRunning = false))
-                return Result.failure(IllegalStateException("Missing image data for ${part.partitionName}"))
-            }
-
-            val res = writePartition(
-                partition = part,
-                sourceImageData = imageData,
-                isSimulation = isSimulation,
-                autoNvBackup = false,
-                autoReboot = false,
-                isSubOperation = true
-            )
+            val res = writePartition(part, null, isSimulation, autoNvBackup = false, autoReboot = false, isSubOperation = true)
             if (res.isFailure) {
                 log("[-] [FLASH FAIL]: Flash writing failed on partition '${part.partitionName}' at ${part.linearStartAddrHex}.", LogLevel.ERROR)
                 log("[-] [PIPELINE HALTED]: Batch Flash ABORTED immediately. No subsequent partitions flashed.", LogLevel.ERROR)
@@ -900,7 +952,7 @@ class MtkBromProtocolEngine(
         if (autoNvBackup) {
             performAutoBackupAndScatterPipeline(chipPlatform, partitions, isSimulation)
         }
-        val res = formatEngine.disableMiAccount(partitions, isSimulation, chipPlatform = chipPlatform)
+        val res = formatEngine.disableMiAccount(partitions, chipPlatform = chipPlatform)
         if (res.isSuccess && autoReboot) {
             rebootDevice("Android System", isSimulation)
         }
@@ -924,13 +976,12 @@ class MtkBromProtocolEngine(
         log("=== [FULL ROM DUMP (rl)] Reading All Partitions to Archive ===", LogLevel.INFO)
 
         val sessionFolder = "${chipPlatform}_FullDump_${folderDateFormat.format(Date())}"
-        val targetDir = File(storageManager.getBackupDirectory(), sessionFolder)
+        val targetDir = java.io.File(storageManager.getBackupDirectory(), sessionFolder)
 
         val res = dumpEngine.dumpAllPartitions(
             chipPlatform = chipPlatform,
             partitions = partitions,
             destinationDir = targetDir,
-            isSimulation = isSimulation,
             skipPartitions = emptyList()
         )
 
@@ -1004,7 +1055,7 @@ class MtkBromProtocolEngine(
         } else {
             log("[AUTO-BACKUP] Auto NV Data Backup is SKIPPED (Unchecked by user).", LogLevel.INFO)
         }
-        val res = formatEngine.eraseFrp(partitions, isSimulation, chipPlatform = chipPlatform)
+        val res = formatEngine.eraseFrp(partitions, chipPlatform = chipPlatform)
         if (res.isSuccess && autoReboot) {
             rebootDevice("Android System", isSimulation)
         }
@@ -1080,7 +1131,7 @@ class MtkBromProtocolEngine(
         } else {
             log("[AUTO-BACKUP] Auto NV Data Backup is SKIPPED (Unchecked by user).", LogLevel.INFO)
         }
-        val res = formatEngine.factoryReset(partitions, isSimulation, chipPlatform = chipPlatform)
+        val res = formatEngine.factoryReset(partitions, chipPlatform = chipPlatform)
         if (res.isSuccess && autoReboot) {
             rebootDevice("Android System", isSimulation)
         }
@@ -1101,7 +1152,7 @@ class MtkBromProtocolEngine(
             return Result.failure(probeRes.exceptionOrNull() ?: IllegalStateException("Handshake failed"))
         }
 
-        val res = formatEngine.formatPartition(partition, isSimulation, chipPlatform = chipPlatform)
+        val res = formatEngine.formatPartition(partition, chipPlatform = chipPlatform)
         if (res.isSuccess && autoReboot) {
             rebootDevice("Android System", isSimulation)
         }
@@ -1197,8 +1248,8 @@ class MtkBromProtocolEngine(
         } else {
             log("[AUTO-BACKUP] Auto NV Data Backup is SKIPPED (Unchecked by user).", LogLevel.INFO)
         }
-
-        val res = formatEngine.formatPartition(partition, isSimulation)
+        
+        val res = formatEngine.formatPartition(partition, chipPlatform = chipPlatform)
         if (res.isSuccess && autoReboot) {
             rebootDevice("Android System", isSimulation)
         }

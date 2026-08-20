@@ -249,9 +249,9 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
             addLog(TerminalLog(now(), "[HARDWARE TARGET MATCH] SoC: ${target.socName.uppercase()} | Mode: ${target.mode} | SecReg: 0x${target.secReg.toString(16)} | BlAddr: 0x${target.bladdr.toString(16)} | UART: 0x${target.uartReg0.toString(16)}", LogLevel.SUCCESS))
             addLog(TerminalLog(now(), "[EXPLOIT CONFIG] Stage1 Payload: ${target.payloadFileName} (Auto-bound)", LogLevel.INFO))
         }
-        val bromOffsets = com.example.protocol.MtkBromOffsetsCatalog.findBromOffsets(model.chipCode)
-        if (bromOffsets != null) {
-            addLog(TerminalLog(now(), "[BROM I/O OFFSETS] PutData: 0x${bromOffsets.usbdlPutData.toString(16)} | GetData: 0x${bromOffsets.usbdlGetData.toString(16)} | WDT: 0x${bromOffsets.wdt.toString(16)}", LogLevel.INFO))
+        val chipConfig = com.example.protocol.MtkChipConfigDatabase.findConfigByName(model.chipCode)
+        if (chipConfig != null) {
+            addLog(TerminalLog(now(), "[CHIP CONFIG] HW Code: 0x${chipConfig.hwCode.toString(16).uppercase()} | WDT: 0x${chipConfig.watchdog.toString(16).uppercase()} | UART: 0x${chipConfig.uart.toString(16).uppercase()} | DA Mode: ${chipConfig.damode}", LogLevel.INFO))
         }
         addLog(TerminalLog(now(), "BROM Connection Guide: ${model.bromInstruction}", LogLevel.INFO))
     }

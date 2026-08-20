@@ -73,8 +73,7 @@ class MtkCalibrationEngine(
 
         val wroteSuccess = flashEngine.flashLegacy(
             partition = seccfgPart,
-            data = v4UnlockPayload,
-            isSimulation = false
+            data = v4UnlockPayload
         )
 
         if (wroteSuccess) {
@@ -130,8 +129,7 @@ class MtkCalibrationEngine(
 
         val wroteSuccess = flashEngine.flashLegacy(
             partition = seccfgPart,
-            data = v4LockPayload,
-            isSimulation = false
+            data = v4LockPayload
         )
 
         if (wroteSuccess) {
@@ -170,7 +168,7 @@ class MtkCalibrationEngine(
             val outFile = File(targetDir, "${part.partitionName}.bin")
             log("[${idx + 1}/${targets.size}] Reading ${part.partitionName} (${part.formattedSize})...", LogLevel.INFO)
 
-            val res = dumpEngine.dumpPartition(part, outFile, isSimulation)
+            val res = dumpEngine.dumpPartition(part, outFile)
             if (res.isSuccess) {
                 dumpedPaths.add(outFile.absolutePath)
                 log("[+] Saved: ${outFile.name} (${outFile.length() / 1024} KB)", LogLevel.SUCCESS)
