@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- MediaTek Vendor ID 0x0E8D (3725 in decimal) -->
+    <!-- MTK USB Port (BROM Mode - 0x0003) -->
+    <usb-device vendor-id="3725" product-id="3" />
+    <!-- MTK Preloader / DA USB VCOM Port (0x2000) -->
+    <usb-device vendor-id="3725" product-id="8192" />
+    <!-- MTK DA USB VCOM (0x2001) -->
+    <usb-device vendor-id="3725" product-id="8193" />
+    <!-- MTK USB Modem / CDC (0x2004) -->
+    <usb-device vendor-id="3725" product-id="8196" />
+    <!-- MTK BootROM Generic (0x0001) -->
+    <usb-device vendor-id="3725" product-id="1" />
+    <!-- All MediaTek Inc Devices (Vendor-level catch-all) -->
+    <usb-device vendor-id="3725" />
+</resources>

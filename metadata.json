@@ -1,0 +1,8 @@
+{
+  "name": "Native Unlock Tool",
+  "description": "MediaTek BROM / DA Protocol Bridge and Flashing Diagnostic Tool",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
