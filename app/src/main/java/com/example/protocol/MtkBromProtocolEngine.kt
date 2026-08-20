@@ -288,7 +288,6 @@ class MtkBromProtocolEngine(
             log("[+] Bootloader State     : ${if (isSecBoot) "LOCKED / ENFORCED" else "UNLOCKED (seccfg)"}", LogLevel.SUCCESS)
             log("[+] Storage Type         : eMMC / UFS (GPT Initialized)", LogLevel.CYAN)
             log("[+] Device Model Match   : $guessedBrand", LogLevel.ACCENT)
-            log("[+] GPT Partition Table  : VALID (Active in Partitions Manager)", LogLevel.SUCCESS)
             log("================================================================", LogLevel.ACCENT)
 
             val info = MtkChipInfo(
@@ -364,15 +363,10 @@ class MtkBromProtocolEngine(
             }
         }
 
-        // If in simulation mode, generate a mock raw GPT byte structure and parse it with GptParser to ensure strictly dynamic execution
+        // If hardware read didn't return partition table (e.g. storage not initialized or DA required),
+        // do not inject fake partitions. Return strictly what the device reports.
         if (parsedPartitions.isEmpty()) {
-            if (isSimulation) {
-                delay(120)
-                parsedPartitions.addAll(generateSimulatedGptLayout(chipPlatform))
-                log("[+] GPT Partition Table loaded (${parsedPartitions.size} Partitions).", LogLevel.SUCCESS)
-            } else {
-                log("[!] GPT read returned 0 partitions from target device.", LogLevel.WARNING)
-            }
+            log("[-] [GPT READ FAIL]: Could not read partition table from eMMC/UFS. Download Agent (DA) / Exploit Payload required.", LogLevel.ERROR)
         }
 
         return parsedPartitions

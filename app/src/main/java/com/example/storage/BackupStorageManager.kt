@@ -28,13 +28,23 @@ class BackupStorageManager(private val context: Context) {
         }
 
         // Try standard Public Download/MTK_Backups so user can easily see in File Manager
-        val publicDownloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val candidate = File(publicDownloads, "MTK_Backups")
-        if (candidate.exists() || candidate.mkdirs()) {
-            return candidate
+        try {
+            val publicDownloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            val candidate = File(publicDownloads, "MTK_Backups")
+            if (candidate.exists() || candidate.mkdirs()) {
+                // Check if directory is actually writable (handles Scoped Storage on Android 11+)
+                val testFile = File(candidate, ".write_test")
+                if (testFile.createNewFile()) {
+                    testFile.delete()
+                    return candidate
+                }
+            }
+        } catch (_: Exception) {
+            // Fallback to app external or internal storage on permission denial
         }
 
         val baseDir = context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS)
+            ?: context.getExternalFilesDir(null)
             ?: context.filesDir
         val backupDir = File(baseDir, "MTK_Backups")
         if (!backupDir.exists()) {

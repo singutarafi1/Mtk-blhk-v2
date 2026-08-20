@@ -433,8 +433,20 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         activeJob?.cancel()
         activeJob = viewModelScope.launch {
             val isSim = _isDryRun.value
-            val chip = _scatterPlatform.value
-            val parts = _partitions.value
+            val chip = if (_scatterPlatform.value == "Unknown / Auto" || _scatterPlatform.value.isEmpty()) _selectedModel.value.chipCode else _scatterPlatform.value
+            var parts = _partitions.value
+            if (parts.isEmpty()) {
+                val gptParts = protocolEngine.readDeviceGpt(isSim, chip)
+                if (gptParts.isNotEmpty()) {
+                    _partitions.value = gptParts
+                    parts = gptParts
+                } else {
+                    addLog(TerminalLog(now(), "[-] [STORAGE UNINITIALIZED]: Device partition table could not be read from eMMC/UFS. DA (Download Agent) or BootROM Security Exploit required before flash memory read/write.", LogLevel.ERROR))
+                    _operationProgress.value = OperationProgress(isRunning = false, percentage = 0f)
+                    com.example.audio.ToolSoundManager.playOperationStop()
+                    return@launch
+                }
+            }
             val mode = _backupMode.value
             val autoReboot = _autoReboot.value
 
@@ -532,8 +544,20 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         activeJob = viewModelScope.launch {
             val func = _selectedServiceFunction.value
             val isSim = _isDryRun.value
-            val chip = _scatterPlatform.value
-            val parts = _partitions.value
+            val chip = if (_scatterPlatform.value == "Unknown / Auto" || _scatterPlatform.value.isEmpty()) _selectedModel.value.chipCode else _scatterPlatform.value
+            var parts = _partitions.value
+            if (parts.isEmpty() && func != ServiceFunction.READ_INFO && func != ServiceFunction.BYPASS_AUTH && func != ServiceFunction.CRASH_TO_BROM) {
+                val gptParts = protocolEngine.readDeviceGpt(isSim, chip)
+                if (gptParts.isNotEmpty()) {
+                    _partitions.value = gptParts
+                    parts = gptParts
+                } else {
+                    addLog(TerminalLog(now(), "[-] [STORAGE UNINITIALIZED]: Device partition table could not be read. DA or Auth Bypass required for ${func.title}.", LogLevel.ERROR))
+                    _operationProgress.value = OperationProgress(isRunning = false, percentage = 0f)
+                    com.example.audio.ToolSoundManager.playOperationStop()
+                    return@launch
+                }
+            }
             val autoReboot = _autoReboot.value
             val autoNvBackup = _autoNvBackup.value
 
