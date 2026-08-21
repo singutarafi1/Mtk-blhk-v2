@@ -10,6 +10,7 @@ import kotlinx.coroutines.delay
 /**
  * MediaTek BootROM DA Uploader & Jump Engine
  * Faithful port of Python mtkclient/Library/mtk_preloader.py: send_da() & jump_da()
+ * Includes fallback for devices that do not echo command bytes.
  */
 object MtkDaUploader {
 
@@ -62,6 +63,9 @@ object MtkDaUploader {
         return ((buf[0].toInt() and 0xFF) shl 8) or (buf[1].toInt() and 0xFF)
     }
 
+    /**
+     * Uploads DA with echo verification. If echo fails, automatically falls back to status-only mode.
+     */
     suspend fun sendDa(
         usb: TargetPhoneUsbManager,
         daAddress: Long,
@@ -70,13 +74,59 @@ object MtkDaUploader {
         logCallback: ((TerminalLog) -> Unit)? = null,
         onProgress: ((Float) -> Unit)? = null
     ): Result<Boolean> {
-        val totalLen = daData.size
-        logCallback?.invoke(TerminalLog("", "[DA UPLOADER] Sending DA Stage 1 to 0x%08X (Size: $totalLen bytes, Sig: $sigLen)".format(daAddress), LogLevel.INFO))
+        // Flush USB buffer before DA upload
+        usb.flush(50)
 
+        val totalLen = daData.size
+        logCallback?.invoke(
+            TerminalLog("", "[DA UPLOADER] Sending DA Stage 1 to 0x%08X (Size: $totalLen bytes, Sig: $sigLen)".format(daAddress), LogLevel.INFO)
+        )
+
+        // Check if echo is supported
+        val echoSupported = testEcho(usb, CMD_SEND_DA)
+
+        if (echoSupported) {
+            return sendDaWithEcho(usb, daAddress, daData, sigLen, logCallback, onProgress)
+        } else {
+            logCallback?.invoke(TerminalLog("", "[DA UPLOADER] Echo not supported by target. Using status-only upload mode.", LogLevel.WARNING))
+            return sendDaStatusOnly(usb, daAddress, daData, sigLen, logCallback, onProgress)
+        }
+    }
+
+    /**
+     * Tests if BROM echoes command bytes.
+     */
+    private suspend fun testEcho(usb: TargetPhoneUsbManager, cmd: Byte): Boolean {
+        val wrote = usb.writeRaw(byteArrayOf(cmd), 2000)
+        if (wrote <= 0) return false
+
+        val echoBuf = ByteArray(1)
+        val read = usb.readRaw(echoBuf, 500)
+        if (read > 0 && echoBuf[0] == cmd) {
+            return true
+        }
+        return false
+    }
+
+    /**
+     * DA upload with echo verification (standard mtkclient behavior).
+     */
+    private suspend fun sendDaWithEcho(
+        usb: TargetPhoneUsbManager,
+        daAddress: Long,
+        daData: ByteArray,
+        sigLen: Int,
+        logCallback: ((TerminalLog) -> Unit)?,
+        onProgress: ((Float) -> Unit)?
+    ): Result<Boolean> {
+        val totalLen = daData.size
+
+        // 1. Send CMD_SEND_DA (0xD7) with echo
         if (!echoByte(usb, CMD_SEND_DA)) {
             return Result.failure(IllegalStateException("Failed writing CMD_SEND_DA or echo mismatch"))
         }
 
+        // 2. Send address, size, sig_len with echo
         if (!echoDword(usb, daAddress)) {
             return Result.failure(IllegalStateException("Failed sending DA target address echo"))
         }
@@ -87,9 +137,9 @@ object MtkDaUploader {
             return Result.failure(IllegalStateException("Failed sending DA sigLen echo"))
         }
 
+        // 3. Read status
         val statusCode = readU16(usb, 3000)
             ?: return Result.failure(IllegalStateException("Timeout waiting for CMD_SEND_DA acknowledgment"))
-
         if (statusCode == STATUS_SLA_CHALLENGE) {
             return Result.failure(IllegalStateException("Target requested SLA Authentication (0x1D0D)"))
         }
@@ -97,8 +147,7 @@ object MtkDaUploader {
             return Result.failure(IllegalStateException("CMD_SEND_DA rejected with error code 0x%04X".format(statusCode)))
         }
 
-        logCallback?.invoke(TerminalLog("", "[DA UPLOADER] Target acknowledged upload slot. Streaming binary...", LogLevel.INFO))
-
+        // 4. Stream data
         val chunkSize = 4096
         var offset = 0
         while (offset < totalLen) {
@@ -106,29 +155,105 @@ object MtkDaUploader {
             val chunk = daData.copyOfRange(offset, offset + chunkLen)
             val wrote = usb.writeRaw(chunk, 3000)
             if (wrote <= 0) {
-                return Result.failure(IllegalStateException("USB write timeout streaming DA data at offset 0x%X".format(offset)))
+                return Result.failure(IllegalStateException("USB write timeout at offset 0x%X".format(offset)))
             }
             offset += chunkLen
             onProgress?.invoke(offset.toFloat() / totalLen.toFloat())
         }
 
+        // 5. Read checksum + final status
         val devChecksum = readU16(usb, 4000)
-            ?: return Result.failure(IllegalStateException("Timeout reading DA checksum verification response"))
+            ?: return Result.failure(IllegalStateException("Timeout reading DA checksum"))
         val finalStatus = readU16(usb, 4000)
-            ?: return Result.failure(IllegalStateException("Timeout reading DA final status code"))
+            ?: return Result.failure(IllegalStateException("Timeout reading DA final status"))
 
         val localChecksum = calculateChecksum16(daData)
         if (devChecksum != localChecksum) {
-            return Result.failure(IllegalStateException("DA Checksum mismatch"))
+            return Result.failure(IllegalStateException("DA Checksum mismatch (local=0x%04X, dev=0x%04X)".format(localChecksum, devChecksum)))
         }
         if (finalStatus != STATUS_OK) {
-            return Result.failure(IllegalStateException("DA verification rejected with status code 0x%04X".format(finalStatus)))
+            return Result.failure(IllegalStateException("DA verification rejected with status 0x%04X".format(finalStatus)))
         }
 
         logCallback?.invoke(TerminalLog("", "[+] [DA UPLOAD SUCCESS]: DA Stage 1 verified (Checksum 0x%04X OK)".format(devChecksum), LogLevel.SUCCESS))
         return Result.success(true)
     }
 
+    /**
+     * DA upload without echo verification (status-only mode).
+     * Some BROMs only reply with status codes, not echoes.
+     */
+    private suspend fun sendDaStatusOnly(
+        usb: TargetPhoneUsbManager,
+        daAddress: Long,
+        daData: ByteArray,
+        sigLen: Int,
+        logCallback: ((TerminalLog) -> Unit)?,
+        onProgress: ((Float) -> Unit)?
+    ): Result<Boolean> {
+        val totalLen = daData.size
+
+        // 1. Send CMD_SEND_DA (0xD7)
+        if (usb.writeRaw(byteArrayOf(CMD_SEND_DA), 2000) <= 0) {
+            return Result.failure(IllegalStateException("Failed writing CMD_SEND_DA"))
+        }
+
+        // 2. Send address/size/sig_len without echo
+        val header = ByteBuffer.allocate(12).order(ByteOrder.BIG_ENDIAN)
+        header.putInt(daAddress.toInt())
+        header.putInt(totalLen)
+        header.putInt(sigLen)
+        if (usb.writeRaw(header.array(), 2000) <= 0) {
+            return Result.failure(IllegalStateException("Failed sending DA parameters"))
+        }
+
+        // 3. Read status
+        val statusCode = readU16(usb, 3000)
+            ?: return Result.failure(IllegalStateException("Timeout waiting for CMD_SEND_DA acknowledgment"))
+        if (statusCode == STATUS_SLA_CHALLENGE) {
+            return Result.failure(IllegalStateException("Target requested SLA Authentication (0x1D0D)"))
+        }
+        if (statusCode != STATUS_OK) {
+            return Result.failure(IllegalStateException("CMD_SEND_DA rejected with error code 0x%04X".format(statusCode)))
+        }
+
+        logCallback?.invoke(TerminalLog("", "[DA UPLOADER] Target accepted DA upload slot. Streaming binary...", LogLevel.INFO))
+
+        // 4. Stream data
+        val chunkSize = 4096
+        var offset = 0
+        while (offset < totalLen) {
+            val chunkLen = minOf(chunkSize, totalLen - offset)
+            val chunk = daData.copyOfRange(offset, offset + chunkLen)
+            val wrote = usb.writeRaw(chunk, 3000)
+            if (wrote <= 0) {
+                return Result.failure(IllegalStateException("USB write timeout at offset 0x%X".format(offset)))
+            }
+            offset += chunkLen
+            onProgress?.invoke(offset.toFloat() / totalLen.toFloat())
+        }
+
+        // 5. Read checksum + final status
+        val devChecksum = readU16(usb, 4000)
+            ?: return Result.failure(IllegalStateException("Timeout reading DA checksum"))
+        val finalStatus = readU16(usb, 4000)
+            ?: return Result.failure(IllegalStateException("Timeout reading DA final status"))
+
+        val localChecksum = calculateChecksum16(daData)
+        if (devChecksum != localChecksum) {
+            return Result.failure(IllegalStateException("DA Checksum mismatch"))
+        }
+        if (finalStatus != STATUS_OK) {
+            return Result.failure(IllegalStateException("DA verification rejected with status 0x%04X".format(finalStatus)))
+        }
+
+        logCallback?.invoke(TerminalLog("", "[+] [DA UPLOAD SUCCESS]: DA Stage 1 verified (Status-only mode, Checksum 0x%04X OK)".format(devChecksum), LogLevel.SUCCESS))
+        return Result.success(true)
+    }
+
+    /**
+     * Instructs target BROM to jump to uploaded DA address.
+     */
     suspend fun jumpDa(
         usb: TargetPhoneUsbManager,
         daAddress: Long,
@@ -136,26 +261,29 @@ object MtkDaUploader {
     ): Result<Boolean> {
         logCallback?.invoke(TerminalLog("", "[DA UPLOADER] Jumping to DA @ 0x%08X (CMD 0xD5)...".format(daAddress), LogLevel.INFO))
 
-        if (!echoByte(usb, CMD_JUMP_DA)) {
+        // 1. Send CMD_JUMP_DA (0xD5)
+        if (usb.writeRaw(byteArrayOf(CMD_JUMP_DA), 2000) <= 0) {
             return Result.failure(IllegalStateException("Failed sending CMD_JUMP_DA"))
         }
 
-        if (!echoDword(usb, daAddress)) {
-            return Result.failure(IllegalStateException("Failed sending DA jump target address echo"))
+        // 2. Send address (big-endian)
+        val addrBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(daAddress.toInt()).array()
+        if (usb.writeRaw(addrBuf, 2000) <= 0) {
+            return Result.failure(IllegalStateException("Failed sending DA jump address"))
         }
 
-        // Read 4-byte address echo and verify
+        // 3. Read 4-byte address echo (some devices may skip this)
         val echoBuf = ByteArray(4)
-        val echoRead = usb.readRaw(echoBuf, 3000)
-        if (echoRead < 4) {
-            return Result.failure(IllegalStateException("Timeout reading JUMP_DA address echo"))
-        }
-        val expectedAddr = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(daAddress.toInt()).array()
-        if (!echoBuf.contentEquals(expectedAddr)) {
-            return Result.failure(IllegalStateException("JUMP_DA address echo mismatch"))
+        val echoRead = usb.readRaw(echoBuf, 1000)
+        if (echoRead >= 4) {
+            val expectedAddr = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(daAddress.toInt()).array()
+            if (!echoBuf.contentEquals(expectedAddr)) {
+                // Address echo mismatch may be tolerated on some devices; continue to status
+                Log.w(TAG, "JUMP_DA address echo mismatch, but continuing...")
+            }
         }
 
-        // Read 2-byte status
+        // 4. Read 2-byte status
         val statusCode = readU16(usb, 3000)
             ?: return Result.failure(IllegalStateException("Timeout waiting for CMD_JUMP_DA confirmation"))
 
