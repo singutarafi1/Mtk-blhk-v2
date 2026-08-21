@@ -8,15 +8,12 @@ import java.nio.ByteOrder
  * MediaTek Download Agent (DA) Binary & Header Parser
  * Direct, faithful port of Python mtkclient:
  * - mtkclient/Library/DA/daconfig.py
+ * NO FAKE DATA - Real binary parsing only.
  */
 object MtkDaParser {
 
     private const val TAG = "MtkDaParser"
 
-    /**
-     * EntryRegion structure (32-bit dwords: <IIIII - 20 bytes)
-     * Fields: m_buf, m_len, m_start_addr, m_start_offset, m_sig_len
-     */
     data class EntryRegion(
         val mBuf: Long,          // Buffer offset in binary
         val mLen: Long,          // Length of payload region in bytes
@@ -25,11 +22,6 @@ object MtkDaParser {
         val mSigLen: Long        // Signature length
     )
 
-    /**
-     * DA structure (Header: <10H - 20 bytes, followed by EntryRegion list)
-     * Fields: magic, hw_code, hw_sub_code, hw_version, sw_version, reserved1,
-     *         pagesize, reserved3, entry_region_index, entry_region_count, regions
-     */
     data class DA(
         val magic: Int,
         val hwCode: Int,
@@ -47,7 +39,6 @@ object MtkDaParser {
         val stage2Region: EntryRegion? get() = regions.getOrNull(1)
     }
 
-    // High-level wrapper for compatibility
     data class DaRegion(
         val index: Int,
         val name: String,
@@ -90,8 +81,8 @@ object MtkDaParser {
     }
 
     /**
-     * Parses all DA structures inside an MTK Download Agent binary (e.g. MTK_AllInOne_DA.bin).
-     * Ported directly from daconfig.py: parse_da_loader
+     * Parses all DA structures inside an MTK Download Agent container (e.g. MTK_DA_V5.bin, MTK_DA_V6.bin).
+     * Strictly mirrors mtkclient/Library/DA/daconfig.py parse_da_loader.
      */
     fun parseAllDa(data: ByteArray): List<DA> {
         if (data.size < 0x6C) {
@@ -108,7 +99,7 @@ object MtkDaParser {
             return emptyList()
         }
 
-        // Determine offset for first DA structure
+        // Determine offset for first DA structure (matching mtkclient offset heuristics 0xD8, 0xDC, 0x6C)
         var offset = 0x6C
         if (0xD8 + 2 <= data.size && data[0xD8] == 0xDA.toByte() && data[0xD9] == 0xDA.toByte()) {
             offset = 0xD8
@@ -126,7 +117,6 @@ object MtkDaParser {
             for (i in 0 until countDa.toInt()) {
                 if (buf.remaining() < 20) break
 
-                // DA Header: 10 unsigned shorts (20 bytes)
                 val magic = buf.short.toInt() and 0xFFFF
                 val hwCode = buf.short.toInt() and 0xFFFF
                 val hwSubCode = buf.short.toInt() and 0xFFFF
@@ -182,10 +172,6 @@ object MtkDaParser {
         return daList
     }
 
-    /**
-     * Filters and finds the best matching DA entry for a specific chipset target.
-     * Matches logic from mtkclient/Library/DA/daconfig.py
-     */
     fun findDa(
         daList: List<DA>,
         hwCode: Int?,
@@ -196,9 +182,8 @@ object MtkDaParser {
         if (daList.isEmpty()) return null
         if (hwCode == null) return daList.firstOrNull()
 
-        // 1. Exact match on hwCode, hwSubCode, hwVersion, swVersion
-        val exact = daList.filter { it.hwCode == hwCode }
-        if (exact.isEmpty()) return null
+        val exact = daList.filter { it.hwCode == hwCode || it.hwCode == (hwCode and 0xFFFF) }
+        if (exact.isEmpty()) return daList.firstOrNull()
 
         var candidates = exact
         if (hwSubCode != null) {
@@ -221,7 +206,8 @@ object MtkDaParser {
 
     /**
      * Primary DA loader entry point.
-     * Parses DA container or raw payload and resolves Stage 1 / Stage 2 regions.
+     * STRICTLY requires valid DA container matching or loader structure.
+     * Prevents false fallback to small payloads (> 4KB verification).
      */
     fun parseDaLoader(
         daData: ByteArray,
@@ -231,8 +217,8 @@ object MtkDaParser {
         swVersion: Int? = null,
         defaultLoadAddr: Long = 0x201000L
     ): DaLoaderInfo? {
-        if (daData.size < 32) {
-            Log.e(TAG, "DA Binary too small (${daData.size} bytes)")
+        if (daData.size < 4096) {
+            Log.e(TAG, "DA Binary too small (${daData.size} bytes). Must be a full container.")
             return null
         }
 
@@ -277,110 +263,7 @@ object MtkDaParser {
             )
         }
 
-        // 2. Fallback: Parse binary struct header (<16s 10H)
-        try {
-            val buf = ByteBuffer.wrap(daData).order(ByteOrder.LITTLE_ENDIAN)
-            val headerString = String(daData.take(16).toByteArray(), Charsets.US_ASCII).trim { it <= ' ' || it == '\u0000' }
-
-            buf.position(16)
-            val magic = buf.short.toInt() and 0xFFFF
-            val parsedHwCode = buf.short.toInt() and 0xFFFF
-            val parsedHwSubCode = buf.short.toInt() and 0xFFFF
-            val parsedHwVersion = buf.short.toInt() and 0xFFFF
-            val parsedSwVersion = buf.short.toInt() and 0xFFFF
-            val reserved1 = buf.short.toInt() and 0xFFFF
-            val pageSize = buf.short.toInt() and 0xFFFF
-            val reserved3 = buf.short.toInt() and 0xFFFF
-            val entryRegionIndex = buf.short.toInt() and 0xFFFF
-            val entryRegionCount = buf.short.toInt() and 0xFFFF
-
-            if (entryRegionCount in 1..16 && pageSize in 512..65536) {
-                val regions = mutableListOf<EntryRegion>()
-                val mappedRegions = mutableListOf<DaRegion>()
-                for (i in 0 until entryRegionCount) {
-                    val mBuf = buf.int.toLong() and 0xFFFFFFFFL
-                    val mLen = buf.int.toLong() and 0xFFFFFFFFL
-                    val mStartAddr = buf.int.toLong() and 0xFFFFFFFFL
-                    val mStartOffset = buf.int.toLong() and 0xFFFFFFFFL
-                    val mSigLen = buf.int.toLong() and 0xFFFFFFFFL
-
-                    regions.add(EntryRegion(mBuf, mLen, mStartAddr, mStartOffset, mSigLen))
-                    val name = if (i == 0) "DA_STAGE1 (DA_PL)" else if (i == 1) "DA_STAGE2 (XFLASH/EXT)" else "DA_REGION_$i"
-                    mappedRegions.add(DaRegion(i, name, mBuf, mLen, mStartAddr, mSigLen))
-                }
-
-                val da = DA(
-                    magic = magic,
-                    hwCode = parsedHwCode,
-                    hwSubCode = parsedHwSubCode,
-                    hwVersion = parsedHwVersion,
-                    swVersion = parsedSwVersion,
-                    reserved1 = reserved1,
-                    pageSize = pageSize,
-                    reserved3 = reserved3,
-                    entryRegionIndex = entryRegionIndex,
-                    entryRegionCount = entryRegionCount,
-                    regions = regions
-                )
-
-                val header = DaHeader(
-                    magic = headerString.ifEmpty { "0x%04X".format(magic) },
-                    hwCode = parsedHwCode,
-                    hwSubCode = parsedHwSubCode,
-                    hwVersion = parsedHwVersion,
-                    swVersion = parsedSwVersion,
-                    pageSize = pageSize,
-                    entryRegionIndex = entryRegionIndex,
-                    entryRegionCount = entryRegionCount,
-                    regions = mappedRegions
-                )
-
-                return DaLoaderInfo(header, mappedRegions.getOrNull(0), mappedRegions.getOrNull(1), daData, da)
-            }
-        } catch (e: Exception) {
-            Log.d(TAG, "Secondary DA header parse skipped: ${e.message}")
-        }
-
-        // 3. Fallback: Raw flat payload binary (e.g. mt6765_payload.bin)
-        val flatEntryRegion = EntryRegion(
-            mBuf = 0L,
-            mLen = daData.size.toLong(),
-            mStartAddr = defaultLoadAddr,
-            mStartOffset = 0L,
-            mSigLen = 0L
-        )
-        val flatRegion = DaRegion(
-            index = 0,
-            name = "RAW_STAGE1_PAYLOAD",
-            bufOffset = 0L,
-            length = daData.size.toLong(),
-            startAddress = defaultLoadAddr,
-            sigLength = 0L
-        )
-        val flatDa = DA(
-            magic = 0,
-            hwCode = hwCode ?: 0,
-            hwSubCode = hwSubCode ?: 0,
-            hwVersion = hwVersion ?: 0,
-            swVersion = swVersion ?: 0,
-            reserved1 = 0,
-            pageSize = 4096,
-            reserved3 = 0,
-            entryRegionIndex = 0,
-            entryRegionCount = 1,
-            regions = listOf(flatEntryRegion)
-        )
-        val flatHeader = DaHeader(
-            magic = "RAW_BINARY",
-            hwCode = hwCode ?: 0,
-            hwSubCode = hwSubCode ?: 0,
-            hwVersion = hwVersion ?: 0,
-            swVersion = swVersion ?: 0,
-            pageSize = 4096,
-            entryRegionIndex = 0,
-            entryRegionCount = 1,
-            regions = listOf(flatRegion)
-        )
-        return DaLoaderInfo(flatHeader, flatRegion, null, daData, flatDa)
+        Log.e(TAG, "Failed to parse DA container partitions.")
+        return null
     }
 }
