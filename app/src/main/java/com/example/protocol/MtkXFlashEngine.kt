@@ -3,15 +3,19 @@ package com.example.protocol
 import android.util.Log
 import com.example.model.LogLevel
 import com.example.model.TerminalLog
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * MediaTek XFlash Protocol Engine
- * Complete, faithful Kotlin port of Python mtkclient:
+ * MediaTek XFlash Protocol Engine (DA Stage 2 Protocol)
+ * Direct, faithful Kotlin port of Python mtkclient:
  * - mtkclient/Library/DA/xflash/xflash_lib.py
  * - mtkclient/Library/DA/xflash/xflash_param.py
+ * 100% Real Hardware Implementation - No Mock/Simulation Data.
  */
 class MtkXFlashEngine(
     private val usb: TargetPhoneUsbManager,
@@ -19,8 +23,16 @@ class MtkXFlashEngine(
 ) {
     companion object {
         private const val TAG = "MtkXFlashEngine"
+        
+        // Protocol Magic & Defaults
+        const val MAGIC: Int = 0xFEEEEEEF.toInt()
         const val DEFAULT_PACKET_SIZE = 0x20000 // 128KB
-        const val MAX_PARAM_CHUNK = 0x200 // 512 bytes
+        const val MAX_PARAM_CHUNK = 0x200       // 512 bytes parameter sub-packet
+
+        // Status codes matching xflash_param.py
+        const val STATUS_OK = 0x00L
+        const val STATUS_FORMAT_RUNNING = 0x40040004L
+        const val STATUS_FORMAT_DONE = 0x40040005L
     }
 
     var maxPacketSize: Int = DEFAULT_PACKET_SIZE
@@ -33,18 +45,30 @@ class MtkXFlashEngine(
     private fun intLE(value: Int): ByteArray =
         ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array()
 
-    fun calculateChecksum16(data: ByteArray): Int {
+    private fun longLE(value: Long): ByteArray =
+        ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(value).array()
+
+    /**
+     * Calculates 16-bit additive checksum matching xflash_lib.py
+     */
+    fun calculateChecksum16(data: ByteArray, length: Int = data.size): Int {
         var chksum = 0
-        for (b in data) {
-            chksum = (chksum + (b.toInt() and 0xFF)) and 0xFFFF
+        for (i in 0 until length) {
+            chksum = (chksum + (data[i].toInt() and 0xFF)) and 0xFFFF
         }
         return chksum
     }
 
-    // ------- Low-level XFlash I/O -------
+    // =========================================================================
+    // 1. Low-Level XFlash Frame Transmission (xsend / xread)
+    // =========================================================================
+
+    /**
+     * Sends XFlash Frame: [MAGIC (4B: 0xFEEEEEEF)][DataType (4B)][Length (4B)][Payload (NB)]
+     */
     fun xsend(data: ByteArray, dataType: Int = MtkXFlashConstants.DataType.DT_PROTOCOL_FLOW): Boolean {
         val header = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
-        header.putInt(MtkXFlashConstants.MAGIC)
+        header.putInt(MAGIC)
         header.putInt(dataType)
         header.putInt(data.size)
 
@@ -55,22 +79,47 @@ class MtkXFlashEngine(
         return true
     }
 
+    /**
+     * Reads XFlash Frame: Validates 12-byte header magic and extracts payload.
+     */
     fun xread(timeoutMs: Int = 5000): Pair<Int, ByteArray>? {
         val headerBuf = ByteArray(12)
-        if (usb.readRaw(headerBuf, timeoutMs) < 12) return null
+        var totalHeaderRead = 0
+        val startHTime = System.currentTimeMillis()
+
+        while (totalHeaderRead < 12 && (System.currentTimeMillis() - startHTime < timeoutMs)) {
+            val r = usb.readRaw(ByteArray(12 - totalHeaderRead).also {
+                val len = usb.readRaw(it, timeoutMs)
+                if (len > 0) {
+                    System.arraycopy(it, 0, headerBuf, totalHeaderRead, len)
+                    totalHeaderRead += len
+                }
+            }, timeoutMs)
+            if (r < 0) break
+        }
+
+        if (totalHeaderRead < 12) return null
 
         val buf = ByteBuffer.wrap(headerBuf).order(ByteOrder.LITTLE_ENDIAN)
         val magic = buf.int
-        if (magic != MtkXFlashConstants.MAGIC) {
-            Log.w(TAG, "XFlash Magic mismatch: 0x%08X".format(magic))
+        if (magic != MAGIC) {
+            Log.w(TAG, "XFlash Magic mismatch: Expected 0x%08X, got 0x%08X".format(MAGIC, magic))
             return null
         }
+
         val dataType = buf.int
         val length = buf.int
 
+        if (length < 0 || length > 0x1000000) { // Safety ceiling: 16MB per single frame
+            Log.e(TAG, "Invalid payload length in XFlash frame: $length bytes")
+            return null
+        }
+
         val payload = ByteArray(length)
         var received = 0
-        while (received < length) {
+        val startPTime = System.currentTimeMillis()
+
+        while (received < length && (System.currentTimeMillis() - startPTime < timeoutMs)) {
             val temp = ByteArray(length - received)
             val r = usb.readRaw(temp, timeoutMs)
             if (r <= 0) break
@@ -78,11 +127,19 @@ class MtkXFlashEngine(
             received += r
         }
 
+        if (received < length) {
+            Log.w(TAG, "Incomplete XFlash payload: Received $received of $length bytes")
+            return null
+        }
+
         return Pair(dataType, payload)
     }
 
+    /**
+     * Reads and decodes XFlash Return Status Code from DA.
+     */
     fun readStatus(timeoutMs: Int = 5000): XFlashStatus {
-        val resp = xread(timeoutMs) ?: return XFlashStatus(-1L, "Timeout")
+        val resp = xread(timeoutMs) ?: return XFlashStatus(-1L, "Timeout waiting for XFlash status")
         val data = resp.second
         val status = when (data.size) {
             2 -> (ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF).toLong()
@@ -92,19 +149,25 @@ class MtkXFlashEngine(
             }
             else -> 0L
         }
-        return XFlashStatus(status, if (status == 0L) "OK" else "0x%08X".format(status))
+        return XFlashStatus(status, if (status == STATUS_OK) "OK" else "0x%08X".format(status))
     }
 
+    /**
+     * Sends XFlash ACK token (4 zero bytes) and optionally verifies status.
+     */
     fun ack(rstatus: Boolean = true): Boolean {
         if (!xsend(ByteArray(4))) return false
         if (rstatus) return readStatus(5000).isOk
         return true
     }
 
-    // ------- Parameter / Device Control -------
+    // =========================================================================
+    // 2. Parameter Transmission & Device Control (send_param / send_dev_ctrl)
+    // =========================================================================
+
     private fun sendRawPacket(data: ByteArray): Boolean {
         val header = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
-        header.putInt(MtkXFlashConstants.MAGIC)
+        header.putInt(MAGIC)
         header.putInt(MtkXFlashConstants.DataType.DT_PROTOCOL_FLOW)
         header.putInt(data.size)
 
@@ -113,7 +176,8 @@ class MtkXFlashEngine(
         var offset = 0
         while (offset < data.size) {
             val dsize = minOf(MAX_PARAM_CHUNK, data.size - offset)
-            if (usb.writeRaw(data.copyOfRange(offset, offset + dsize), 5000) != dsize) return false
+            val chunk = data.copyOfRange(offset, offset + dsize)
+            if (usb.writeRaw(chunk, 5000) != dsize) return false
             offset += dsize
         }
         return true
@@ -128,6 +192,9 @@ class MtkXFlashEngine(
         return readStatus(5000).isOk
     }
 
+    /**
+     * Executes Device Control queries (e.g. GET_EMMC_INFO, GET_UFS_INFO, REBOOT).
+     */
     fun sendDevCtrl(ctrlCode: Int, param: ByteArray? = null): ByteArray? {
         if (!xsend(intLE(MtkXFlashConstants.Cmd.DEVICE_CTRL))) return null
         if (!readStatus(5000).isOk) return null
@@ -135,40 +202,51 @@ class MtkXFlashEngine(
         if (!xsend(intLE(ctrlCode))) return null
         if (!readStatus(5000).isOk) return null
 
-        if (param == null) {
-            return xread(5000)?.second
+        return if (param == null) {
+            xread(5000)?.second
         } else {
             if (!sendParam(param)) return null
-            return xread(5000)?.second
+            xread(5000)?.second
         }
     }
 
+    /**
+     * Performs Initial XFlash Synchronization (SYNC_SIGNAL 0x434E5953).
+     */
     fun connect(): Boolean {
-        log("[XFLASH] Syncing XFlash Session...", LogLevel.INFO)
+        log("[XFLASH] Establishing XFlash Session Handshake...", LogLevel.INFO)
         if (!xsend(intLE(MtkXFlashConstants.Cmd.SYNC_SIGNAL))) return false
         if (!readStatus(5000).isOk) return false
 
-        getPacketLength()?.let { maxPacketSize = it }
-        log("[XFLASH] Linked. PacketSize=${maxPacketSize / 1024}KB", LogLevel.SUCCESS)
+        getPacketLength()?.let { 
+            if (it in 0x1000..0x100000) {
+                maxPacketSize = it 
+            }
+        }
+        log("[XFLASH] Session active. Negotiated Packet Size: ${maxPacketSize / 1024} KB", LogLevel.SUCCESS)
         return true
     }
 
-    // ------- Command Setup -------
-    fun cmdWriteData(storage: Int, partType: Int, address: Long, length: Long): Boolean {
+    // =========================================================================
+    // 3. Command Setup Headers (WRITE_DATA, READ_DATA, FORMAT)
+    // =========================================================================
+
+    private fun cmdWriteData(storage: Int, partType: Int, address: Long, length: Long): Boolean {
         if (!xsend(intLE(MtkXFlashConstants.Cmd.WRITE_DATA))) return false
         if (!readStatus(5000).isOk) return false
 
+        // 56-byte Setup Structure: Storage(4B) + PartType(4B) + Address(8B) + Length(8B) + NandExt(32B)
         val param = ByteBuffer.allocate(56).order(ByteOrder.LITTLE_ENDIAN)
         param.putInt(storage)
         param.putInt(partType)
         param.putLong(address)
         param.putLong(length)
-        param.put(ByteArray(32)) // NandExtension zero
+        param.put(NandExtension().toBytes())
 
         return sendParam(param.array())
     }
 
-    fun cmdReadData(storage: Int, partType: Int, address: Long, length: Long): Boolean {
+    private fun cmdReadData(storage: Int, partType: Int, address: Long, length: Long): Boolean {
         if (!xsend(intLE(MtkXFlashConstants.Cmd.READ_DATA))) return false
         if (!readStatus(5000).isOk) return false
 
@@ -177,22 +255,32 @@ class MtkXFlashEngine(
         param.putInt(partType)
         param.putLong(address)
         param.putLong(length)
-        param.put(ByteArray(32))
+        param.put(NandExtension().toBytes())
 
         return sendParam(param.array())
     }
 
-    // ------- High-level operations -------
-    fun writeFlash(
-        storage: Int, partType: Int, address: Long, length: Long, data: ByteArray,
+    // =========================================================================
+    // 4. High-Level Flash Operations (Write, Read, Stream Read, Format, BootTo)
+    // =========================================================================
+
+    /**
+     * Flashes binary payload to target partition via XFlash Protocol.
+     */
+    suspend fun writeFlash(
+        storage: Int,
+        partType: Int,
+        address: Long,
+        length: Long,
+        data: ByteArray,
         onProgress: ((Long, Long) -> Unit)? = null
-    ): Boolean {
+    ): Boolean = withContext(Dispatchers.IO) {
         val pad = if (length % 512L != 0L) (512L - (length % 512L)).toInt() else 0
         val paddedLength = length + pad
 
         if (!cmdWriteData(storage, partType, address, paddedLength)) {
-            log("[-] cmdWriteData rejected", LogLevel.ERROR)
-            return false
+            log("[-] cmdWriteData setup rejected by DA Stage 2.", LogLevel.ERROR)
+            return@withContext false
         }
 
         var offset = 0
@@ -209,105 +297,130 @@ class MtkXFlashEngine(
             val p1 = intLE(checksum)
 
             if (!sendParam(listOf(p0, p1, chunk))) {
-                log("[-] Write chunk failed at 0x%X".format(offset), LogLevel.ERROR)
-                return false
+                log("[-] Write chunk failed at offset 0x%X".format(offset), LogLevel.ERROR)
+                return@withContext false
             }
             offset += curLen
             onProgress?.invoke(offset.toLong(), total.toLong())
         }
 
-        if (!readStatus(5000).isOk) return false
+        if (!readStatus(5000).isOk) return@withContext false
         sendDevCtrl(MtkXFlashConstants.Cmd.CC_OPTIONAL_DOWNLOAD_ACT)
 
-        log("[+] Write complete", LogLevel.SUCCESS)
-        return true
+        log("[+] Write complete for address 0x%08X".format(address), LogLevel.SUCCESS)
+        return@withContext true
     }
 
-    fun readFlash(
-        storage: Int, partType: Int, address: Long, length: Long,
+    /**
+     * Reads partition data into Memory ByteArray (Intended for small partitions like GPT, nvram).
+     */
+    suspend fun readFlash(
+        storage: Int,
+        partType: Int,
+        address: Long,
+        length: Long,
         onProgress: ((Long, Long) -> Unit)? = null
-    ): ByteArray? {
+    ): ByteArray? = withContext(Dispatchers.IO) {
         val pad = if (length % 512L != 0L) (512L - (length % 512L)).toInt() else 0
         val paddedLength = length + pad
 
-        if (!cmdReadData(storage, partType, address, paddedLength)) return null
+        if (!cmdReadData(storage, partType, address, paddedLength)) return@withContext null
 
         val result = ByteArray(length.toInt())
-        var read = 0L
+        var readBytes = 0L
 
-        while (read < length) {
-            val resp = xread(5000) ?: return null
+        while (readBytes < length) {
+            val resp = xread(5000) ?: return@withContext null
             val payload = resp.second
 
             if (payload.size > 4) {
-                val copyLen = minOf(payload.size.toLong(), length - read).toInt()
-                System.arraycopy(payload, 0, result, read.toInt(), copyLen)
-                read += copyLen
+                val copyLen = minOf(payload.size.toLong(), length - readBytes).toInt()
+                System.arraycopy(payload, 0, result, readBytes.toInt(), copyLen)
+                readBytes += copyLen
                 ack(false)
-                onProgress?.invoke(read, length)
+                onProgress?.invoke(readBytes, length)
             } else if (payload.size == 4) {
                 val status = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN).int
-                if (status != 0) return null
+                if (status != 0) return@withContext null
             }
         }
-        return result
+        return@withContext result
     }
 
-    fun readFlashToStream(
-        storage: Int, partType: Int, address: Long, length: Long, out: OutputStream,
+    /**
+     * Streams partition dump directly to disk file via OutputStream (Prevents Android OOM Crashes on GB Partitions).
+     */
+    suspend fun readFlashToStream(
+        storage: Int,
+        partType: Int,
+        address: Long,
+        length: Long,
+        out: OutputStream,
         onProgress: ((Long, Long) -> Unit)? = null
-    ): Boolean {
+    ): Boolean = withContext(Dispatchers.IO) {
         val pad = if (length % 512L != 0L) (512L - (length % 512L)).toInt() else 0
         val paddedLength = length + pad
 
-        if (!cmdReadData(storage, partType, address, paddedLength)) return false
+        if (!cmdReadData(storage, partType, address, paddedLength)) return@withContext false
 
-        var read = 0L
-        while (read < length) {
-            val resp = xread(5000) ?: return false
+        var readBytes = 0L
+        while (readBytes < length) {
+            val resp = xread(5000) ?: return@withContext false
             val payload = resp.second
 
             if (payload.size > 4) {
-                val copyLen = minOf(payload.size.toLong(), length - read).toInt()
+                val copyLen = minOf(payload.size.toLong(), length - readBytes).toInt()
                 out.write(payload, 0, copyLen)
-                read += copyLen
+                readBytes += copyLen
                 ack(false)
-                onProgress?.invoke(read, length)
+                onProgress?.invoke(readBytes, length)
             } else if (payload.size == 4) {
                 val status = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN).int
-                if (status != 0) return false
+                if (status != 0) return@withContext false
             }
         }
         out.flush()
-        return true
+        return@withContext true
     }
 
-    fun formatFlash(storage: Int, partType: Int, address: Long, length: Long): Boolean {
-        log("[XFLASH] Formatting...", LogLevel.WARNING)
+    /**
+     * Erases / Formats partition range using DA Stage 2 hardware formatting.
+     */
+    suspend fun formatFlash(
+        storage: Int,
+        partType: Int,
+        address: Long,
+        length: Long
+    ): Boolean = withContext(Dispatchers.IO) {
+        log("[XFLASH] Sending FORMAT command (Addr: 0x%X, Len: 0x%X)...".format(address, length), LogLevel.WARNING)
 
-        if (!xsend(intLE(MtkXFlashConstants.Cmd.FORMAT))) return false
-        if (!readStatus(5000).isOk) return false
+        if (!xsend(intLE(MtkXFlashConstants.Cmd.FORMAT))) return@withContext false
+        if (!readStatus(5000).isOk) return@withContext false
 
         val param = ByteBuffer.allocate(56).order(ByteOrder.LITTLE_ENDIAN)
         param.putInt(storage)
         param.putInt(partType)
         param.putLong(address)
         param.putLong(length)
-        param.put(ByteArray(32))
+        param.put(NandExtension().toBytes())
 
-        if (!sendParam(param.array())) return false
+        if (!sendParam(param.array())) return@withContext false
 
         var status = readStatus(10000)
-        while (status.status == 0x40040004L) {
-            Thread.sleep(100)
+        while (status.status == STATUS_FORMAT_RUNNING) {
+            delay(100)
             ack(false)
             status = readStatus(10000)
         }
-        val success = status.status == 0x40040005L || status.isOk
-        log(if (success) "[+] Format OK" else "[-] Format failed: ${status.msg}", if (success) LogLevel.SUCCESS else LogLevel.ERROR)
-        return success
+
+        val success = status.status == STATUS_FORMAT_DONE || status.isOk
+        log(if (success) "[+] Format operation completed successfully." else "[-] Format failed: ${status.msg}", if (success) LogLevel.SUCCESS else LogLevel.ERROR)
+        return@withContext success
     }
 
+    /**
+     * Uploads DA Stage 2 binary extension directly into Target DRAM via BOOT_TO (0x010008).
+     */
     fun bootTo(address: Long, data: ByteArray, onProgress: ((Long, Long) -> Unit)? = null): Boolean {
         if (!xsend(intLE(MtkXFlashConstants.Cmd.BOOT_TO))) return false
         if (!readStatus(5000).isOk) return false
@@ -328,7 +441,10 @@ class MtkXFlashEngine(
         return true
     }
 
-    // ------- Info Queries -------
+    // =========================================================================
+    // 5. Hardware Information Queries
+    // =========================================================================
+
     fun getPacketLength(): Int? {
         val data = sendDevCtrl(MtkXFlashConstants.Cmd.GET_PACKET_LENGTH) ?: return null
         if (data.size >= 8) {
@@ -391,7 +507,7 @@ class MtkXFlashEngine(
     }
 
     fun reboot(): Boolean {
-        log("[XFLASH] Reboot command sent", LogLevel.INFO)
+        log("[XFLASH] Sending DA Reboot Command (CC_REBOOT)...", LogLevel.INFO)
         return sendDevCtrl(MtkXFlashConstants.Cmd.CC_REBOOT) != null
     }
 }
