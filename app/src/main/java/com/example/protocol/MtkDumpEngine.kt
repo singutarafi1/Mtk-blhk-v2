@@ -61,7 +61,7 @@ class MtkDumpEngine(
                     partType = partType,
                     address = startAddr,
                     length = totalBytes,
-                    outputStream = outStream
+                    out = outStream
                 ) { read, total ->
                     val progress = (read.toFloat() / total.toFloat()).coerceIn(0f, 1f)
                     val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.001)
