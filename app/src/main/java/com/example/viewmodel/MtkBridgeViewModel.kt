@@ -3,7 +3,6 @@ package com.example.viewmodel
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.ai.GeminiDiagnosticAdvisor
 import com.example.model.AppNavDestination
 import com.example.model.BackupMode
 import com.example.model.BridgeStatus
@@ -19,17 +18,19 @@ import com.example.model.ServiceFunction
 import com.example.model.TerminalLog
 import com.example.model.TransportType
 import com.example.parser.ScatterParser
-import com.example.protocol.MtkAssetManager
 import com.example.protocol.MtkBromProtocolEngine
 import com.example.protocol.MtkStage1TargetCatalog
 import com.example.protocol.TargetPhoneState
 import com.example.protocol.TargetPhoneUsbManager
 import com.example.storage.BackupStorageManager
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -39,7 +40,6 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
     private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault())
     val storageManager = BackupStorageManager(application)
     val targetPhoneUsb = TargetPhoneUsbManager(application)
-    private val aiAdvisor = GeminiDiagnosticAdvisor()
 
     // UI States
     private val _selectedTransportType = MutableStateFlow(TransportType.USB_OTG_DIRECT)
@@ -65,7 +65,7 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
     private val _selectedModel = MutableStateFlow<MtkDeviceModel>(MtkDeviceDatabase.getDefaultModel())
     val selectedModel: StateFlow<MtkDeviceModel> = _selectedModel.asStateFlow()
 
-    private val _scatterPlatform = MutableStateFlow("MT6761")
+    private val _scatterPlatform = MutableStateFlow("Unknown / Auto")
     val scatterPlatform: StateFlow<String> = _scatterPlatform.asStateFlow()
 
     private val _partitions = MutableStateFlow<List<PartitionEntry>>(emptyList())
@@ -86,9 +86,6 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
     private val _backupMode = MutableStateFlow(BackupMode.FULL_FIRMWARE)
     val backupMode: StateFlow<BackupMode> = _backupMode.asStateFlow()
 
-    private val _isDryRun = MutableStateFlow(false)
-    val isDryRun: StateFlow<Boolean> = _isDryRun.asStateFlow()
-
     private val _autoNvBackup = MutableStateFlow(true)
     val autoNvBackup: StateFlow<Boolean> = _autoNvBackup.asStateFlow()
 
@@ -104,15 +101,9 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
     private val _logs = MutableStateFlow<List<TerminalLog>>(emptyList())
     val logs: StateFlow<List<TerminalLog>> = _logs.asStateFlow()
 
-    private val _aiAnalysis = MutableStateFlow<String?>(null)
-    val aiAnalysis: StateFlow<String?> = _aiAnalysis.asStateFlow()
-
-    private val _isAiLoading = MutableStateFlow(false)
-    val isAiLoading: StateFlow<Boolean> = _isAiLoading.asStateFlow()
-
     // File selection paths
     val daAgentPath = MutableStateFlow("Built-in Universal DA (MTK All-in-One)")
-    val customDaPath = daAgentPath // alias
+    val customDaPath = daAgentPath
     val authFilePath = MutableStateFlow("")
     val preloaderPath = MutableStateFlow("")
     val scatterPath = MutableStateFlow("")
@@ -123,13 +114,13 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         protocolEngine = MtkBromProtocolEngine(
+            context = getApplication(),
             targetPhoneUsb = targetPhoneUsb,
             storageManager = storageManager,
             logCallback = { log -> addLog(log) },
             progressCallback = { prog -> _operationProgress.value = prog }
         )
 
-        // Start with empty partition table (professional GSM tool behavior)
         _scatterPlatform.value = "Unknown / Auto"
         _partitions.value = emptyList()
 
@@ -161,6 +152,12 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
                         if (isFirstConnection) {
                             com.example.audio.ToolSoundManager.playUsbConnected()
                         }
+
+                        // Auto handshake if pending
+                        if (pendingHandshake && state.isBromMode) {
+                            pendingHandshake = false
+                            runBromHandshake()
+                        }
                     }
                     is TargetPhoneState.Disconnected -> {
                         val wasPreviouslyConnected = wasConnected
@@ -183,12 +180,12 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    private var pendingHandshake = false
+
     fun addLog(log: TerminalLog) {
         val current = _logs.value.toMutableList()
         current.add(log)
-        if (current.size > 500) {
-            current.removeAt(0)
-        }
+        if (current.size > 500) current.removeAt(0)
         _logs.value = current
     }
 
@@ -216,34 +213,40 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
     fun setTransportType(type: TransportType) {
         if (_selectedTransportType.value == type) return
         _selectedTransportType.value = type
-        if (type == TransportType.SIMULATION) {
-            _isDryRun.value = true
-            addLog(TerminalLog(now(), "Switched to Dry-Run / Simulation Mode", LogLevel.INFO))
+        // Always real USB OTG in native tool
+        if (type != TransportType.USB_OTG_DIRECT) {
+            addLog(TerminalLog(now(), "Only Direct USB OTG mode is supported.", LogLevel.WARNING))
         } else {
-            _isDryRun.value = false
-            addLog(TerminalLog(now(), "Switched to Direct USB OTG Host Mode", LogLevel.SUCCESS))
+            addLog(TerminalLog(now(), "Direct USB OTG Host Mode active.", LogLevel.SUCCESS))
         }
     }
 
     fun scanTargetPhone() {
         viewModelScope.launch {
-            addLog(TerminalLog(now(), "Scanning USB Host for MediaTek BROM/Preloader ports...", LogLevel.INFO))
-            targetPhoneUsb.scanAndConnect()
-            runBromHandshake()
+            addLog(TerminalLog(now(), "Scanning USB Host for MediaTek BROM ports...", LogLevel.INFO))
+            pendingHandshake = true
+            val connected = withContext(Dispatchers.IO) {
+                targetPhoneUsb.scanAndConnect(forceBromOnly = true)
+            }
+            if (connected && targetPhoneUsb.isBromConnected()) {
+                pendingHandshake = false
+                runBromHandshake()
+            } else {
+                addLog(TerminalLog(now(), "No BROM device found. Waiting for USB device attach...", LogLevel.INFO))
+            }
         }
     }
 
     fun selectBrand(brand: MtkBrand) {
         _selectedBrand.value = brand
-        val firstModel = brand.models.firstOrNull() ?: return
-        selectModel(firstModel)
+        brand.models.firstOrNull()?.let { selectModel(it) }
     }
 
     fun selectModel(model: MtkDeviceModel) {
         _selectedModel.value = model
         _scatterPlatform.value = model.chipCode
         addLog(TerminalLog(now(), "Selected Device: ${_selectedBrand.value.brandName} -> ${model.modelName} [${model.chipset}]", LogLevel.SUCCESS))
-        
+
         val target = MtkStage1TargetCatalog.findTarget(model.chipCode)
         if (target != null) {
             addLog(TerminalLog(now(), "[HARDWARE TARGET MATCH] SoC: ${target.socName.uppercase()} | Mode: ${target.mode} | SecReg: 0x${target.secReg.toString(16)} | BlAddr: 0x${target.bladdr.toString(16)} | UART: 0x${target.uartReg0.toString(16)}", LogLevel.SUCCESS))
@@ -251,7 +254,7 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         }
         val chipConfig = com.example.protocol.MtkChipConfigDatabase.findConfigByName(model.chipCode)
         if (chipConfig != null) {
-            addLog(TerminalLog(now(), "[CHIP CONFIG] HW Code: 0x${chipConfig.hwCode.toString(16).uppercase()} | WDT: 0x${chipConfig.watchdog.toString(16).uppercase()} | UART: 0x${chipConfig.uart.toString(16).uppercase()} | DA Mode: ${chipConfig.damode}", LogLevel.INFO))
+            addLog(TerminalLog(now(), "[CHIP CONFIG] HW Code: 0x${chipConfig.hwCode.toString(16).uppercase()} | WDT: 0x${chipConfig.watchdog.toString(16).uppercase()} | DA Mode: ${chipConfig.damode}", LogLevel.INFO))
         }
         addLog(TerminalLog(now(), "BROM Connection Guide: ${model.bromInstruction}", LogLevel.INFO))
     }
@@ -281,19 +284,15 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun selectPartition(index: Int) {
-        selectPartitionIndex(index)
-    }
+    fun selectPartition(index: Int) = selectPartitionIndex(index)
 
     fun selectAllPartitions(selectAll: Boolean) {
         val list = _partitions.value.map { it.copy(isSelectedForFlashing = selectAll) }
         _partitions.value = list
-        addLog(TerminalLog(now(), if (selectAll) "Selected all partitions for flashing." else "Deselected all partitions.", LogLevel.INFO))
+        addLog(TerminalLog(now(), if (selectAll) "Selected all partitions." else "Deselected all partitions.", LogLevel.INFO))
     }
 
-    fun toggleSelectAllPartitions(selectAll: Boolean) {
-        selectAllPartitions(selectAll)
-    }
+    fun toggleSelectAllPartitions(selectAll: Boolean) = selectAllPartitions(selectAll)
 
     fun selectPartitionIndex(index: Int) {
         if (index in _partitions.value.indices) {
@@ -307,13 +306,9 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun toggleDryRun(enabled: Boolean) {
-        _isDryRun.value = enabled
+        // Dry-run not supported in real native tool
         if (enabled) {
-            setTransportType(TransportType.SIMULATION)
-            addLog(TerminalLog(now(), "Dry-Run / Simulation Mode ENABLED. Safe testing active.", LogLevel.SUCCESS))
-        } else {
-            setTransportType(TransportType.USB_OTG_DIRECT)
-            addLog(TerminalLog(now(), "Dry-Run Mode DISABLED. Real Direct USB OTG active.", LogLevel.WARNING))
+            addLog(TerminalLog(now(), "Dry-Run mode is disabled in native tool.", LogLevel.WARNING))
         }
     }
 
@@ -350,22 +345,38 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun toggleFlashAfterBlUnlock(enabled: Boolean) {
         _flashOptions.value = _flashOptions.value.copy(flashAfterBlUnlock = enabled)
-        addLog(TerminalLog(now(), "Flash Action [Flash After BL Unlock]: ${if (enabled) "ENABLED (seccfg patch before flash)" else "DISABLED"}", LogLevel.INFO))
+        addLog(TerminalLog(now(), "Flash Action [Flash After BL Unlock]: ${if (enabled) "ENABLED" else "DISABLED"}", LogLevel.INFO))
     }
 
     fun toggleFlashDaDlChecksum(enabled: Boolean) {
         _flashOptions.value = _flashOptions.value.copy(daDlChecksum = enabled)
-        addLog(TerminalLog(now(), "Flash Action [DA DL Checksum]: ${if (enabled) "ENABLED (Integrity check active)" else "DISABLED"}", LogLevel.INFO))
+        addLog(TerminalLog(now(), "Flash Action [DA DL Checksum]: ${if (enabled) "ENABLED" else "DISABLED"}", LogLevel.INFO))
     }
 
     fun toggleFlashAutoSign(enabled: Boolean) {
         _flashOptions.value = _flashOptions.value.copy(autoSignFlash = enabled)
-        addLog(TerminalLog(now(), "Flash Action [Auto Sign Flash]: ${if (enabled) "ENABLED (Signature bypass active)" else "DISABLED"}", LogLevel.INFO))
+        addLog(TerminalLog(now(), "Flash Action [Auto Sign Flash]: ${if (enabled) "ENABLED" else "DISABLED"}", LogLevel.INFO))
     }
 
     fun toggleFlashFormatAll(enabled: Boolean) {
         _flashOptions.value = _flashOptions.value.copy(formatAllDownload = enabled)
-        addLog(TerminalLog(now(), "Flash Action [Format All + Download]: ${if (enabled) "ENABLED (Warning: Full erase before flash)" else "DISABLED"}", LogLevel.WARNING))
+        addLog(TerminalLog(now(), "Flash Action [Format All + Download]: ${if (enabled) "ENABLED" else "DISABLED"}", LogLevel.WARNING))
+    }
+
+    private fun loadPartitionImageData(partition: PartitionEntry): ByteArray? {
+        val possibleDirs = listOf(
+            storageManager.getBackupDirectory(),
+            File(storageManager.getBackupDirectory(), "firmware"),
+            File("/sdcard/Download"),
+            File("/sdcard/MTKFirmware")
+        )
+        for (dir in possibleDirs) {
+            val file = File(dir, partition.fileName)
+            if (file.exists() && file.canRead()) {
+                return try { file.readBytes() } catch (e: Exception) { null }
+            }
+        }
+        return null
     }
 
     fun executeFlashOperation() {
@@ -376,13 +387,12 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
 
         activeJob?.cancel()
         activeJob = viewModelScope.launch {
-            val isSim = _isDryRun.value
             val chip = _scatterPlatform.value
             val parts = _partitions.value
             val opts = _flashOptions.value
 
             if (parts.none { it.isSelectedForFlashing }) {
-                addLog(TerminalLog(now(), "No partitions selected for flashing. Please check at least one partition in the table.", LogLevel.WARNING))
+                addLog(TerminalLog(now(), "No partitions selected for flashing.", LogLevel.WARNING))
                 com.example.audio.ToolSoundManager.playOperationStop()
                 return@launch
             }
@@ -397,22 +407,20 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
             com.example.audio.ToolSoundManager.playOperationStart()
             addLog(TerminalLog(now(), "Starting Batch Flash for '${_selectedBrand.value.brandName} -> ${_selectedModel.value.modelName}'...", LogLevel.INFO))
             try {
-                val res = protocolEngine.batchFlash(
-                    chipPlatform = chip,
-                    partitions = parts,
-                    isSimulation = isSim,
-                    autoNvBackup = opts.readNvData,
-                    autoReboot = opts.autoReboot,
-                    flashAfterBlUnlock = opts.flashAfterBlUnlock,
-                    daDlChecksum = opts.daDlChecksum,
-                    autoSignFlash = opts.autoSignFlash,
-                    formatAllDownload = opts.formatAllDownload
-                )
-                if (res.isSuccess) {
-                    com.example.audio.ToolSoundManager.playOperationDone()
-                } else {
-                    com.example.audio.ToolSoundManager.playOperationStop()
+                val res = withContext(Dispatchers.IO) {
+                    protocolEngine.batchFlash(
+                        chipPlatform = chip,
+                        partitions = parts,
+                        autoNvBackup = opts.readNvData,
+                        autoReboot = opts.autoReboot,
+                        flashAfterBlUnlock = opts.flashAfterBlUnlock,
+                        daDlChecksum = opts.daDlChecksum,
+                        autoSignFlash = opts.autoSignFlash,
+                        formatAllDownload = opts.formatAllDownload
+                    )
                 }
+                if (res.isSuccess) com.example.audio.ToolSoundManager.playOperationDone()
+                else com.example.audio.ToolSoundManager.playOperationStop()
             } catch (e: kotlinx.coroutines.CancellationException) {
                 com.example.audio.ToolSoundManager.playOperationStop()
             } catch (e: Exception) {
@@ -432,58 +440,35 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
 
         activeJob?.cancel()
         activeJob = viewModelScope.launch {
-            val isSim = _isDryRun.value
             val chip = if (_scatterPlatform.value == "Unknown / Auto" || _scatterPlatform.value.isEmpty()) _selectedModel.value.chipCode else _scatterPlatform.value
             var parts = _partitions.value
-            if (parts.isEmpty()) {
-                val gptParts = protocolEngine.readDeviceGpt(isSim, chip)
-                if (gptParts.isNotEmpty()) {
-                    _partitions.value = gptParts
-                    parts = gptParts
-                } else {
-                    addLog(TerminalLog(now(), "[-] [STORAGE UNINITIALIZED]: Device partition table could not be read from eMMC/UFS. DA (Download Agent) or BootROM Security Exploit required before flash memory read/write.", LogLevel.ERROR))
-                    _operationProgress.value = OperationProgress(isRunning = false, percentage = 0f)
-                    com.example.audio.ToolSoundManager.playOperationStop()
-                    return@launch
-                }
-            }
-            val mode = _backupMode.value
-            val autoReboot = _autoReboot.value
 
             _operationProgress.value = OperationProgress(
                 isRunning = true,
-                title = "Backup: ${mode.title}",
+                title = "Backup: ${_backupMode.value.title}",
                 detail = "Connecting to device storage...",
                 percentage = 0f
             )
 
             com.example.audio.ToolSoundManager.playOperationStart()
-            addLog(TerminalLog(now(), "Initiating Backup Session: ${mode.title} for ${_selectedBrand.value.brandName} [${_selectedModel.value.modelName}]", LogLevel.INFO))
+            addLog(TerminalLog(now(), "Initiating Backup Session: ${_backupMode.value.title} for ${_selectedBrand.value.brandName} [${_selectedModel.value.modelName}]", LogLevel.INFO))
 
             try {
-                val res: Result<*> = when (mode) {
-                    BackupMode.FULL_FIRMWARE -> {
-                        protocolEngine.dumpAllPartitions(chip, parts, isSim)
-                    }
-                    BackupMode.STABLE_FIRMWARE -> {
-                        protocolEngine.dumpStablePartitions(parts, isSim)
-                    }
-                    BackupMode.NV_DATA -> {
-                        protocolEngine.backupNvram(chip, parts, isSim)
-                    }
-                    BackupMode.CUSTOM_PARTITIONS -> {
-                        protocolEngine.dumpCustomPartitions(parts, isSim)
+                val res: Result<*> = withContext(Dispatchers.IO) {
+                    when (_backupMode.value) {
+                        BackupMode.FULL_FIRMWARE -> protocolEngine.dumpAllPartitions(chip, parts)
+                        BackupMode.STABLE_FIRMWARE -> protocolEngine.dumpStablePartitions(parts)
+                        BackupMode.NV_DATA -> protocolEngine.backupNvram(chip, parts)
+                        BackupMode.CUSTOM_PARTITIONS -> protocolEngine.dumpCustomPartitions(parts)
                     }
                 }
 
                 if (res.isSuccess) {
-                    if (autoReboot) {
-                        protocolEngine.rebootDevice("Android System", isSim)
-                    }
+                    if (_autoReboot.value) protocolEngine.rebootDevice("Android System")
                     com.example.audio.ToolSoundManager.playOperationDone()
                 } else {
                     val err = res.exceptionOrNull()?.message ?: "Backup failed"
-                    addLog(TerminalLog(now(), "[-] [BACKUP FAIL]: $err. Pipeline halted.", LogLevel.ERROR))
+                    addLog(TerminalLog(now(), "[-] [BACKUP FAIL]: $err", LogLevel.ERROR))
                     com.example.audio.ToolSoundManager.playOperationStop()
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -518,12 +503,9 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
             )
             com.example.audio.ToolSoundManager.playOperationStart()
             try {
-                val res = protocolEngine.runMemoryTest(_isDryRun.value)
-                if (res.isSuccess) {
-                    com.example.audio.ToolSoundManager.playOperationDone()
-                } else {
-                    com.example.audio.ToolSoundManager.playOperationStop()
-                }
+                val res = withContext(Dispatchers.IO) { protocolEngine.runMemoryTest() }
+                if (res.isSuccess) com.example.audio.ToolSoundManager.playOperationDone()
+                else com.example.audio.ToolSoundManager.playOperationStop()
             } catch (e: kotlinx.coroutines.CancellationException) {
                 com.example.audio.ToolSoundManager.playOperationStop()
             } catch (e: Exception) {
@@ -543,23 +525,8 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         activeJob?.cancel()
         activeJob = viewModelScope.launch {
             val func = _selectedServiceFunction.value
-            val isSim = _isDryRun.value
             val chip = if (_scatterPlatform.value == "Unknown / Auto" || _scatterPlatform.value.isEmpty()) _selectedModel.value.chipCode else _scatterPlatform.value
             var parts = _partitions.value
-            if (parts.isEmpty() && func != ServiceFunction.READ_INFO && func != ServiceFunction.BYPASS_AUTH && func != ServiceFunction.CRASH_TO_BROM) {
-                val gptParts = protocolEngine.readDeviceGpt(isSim, chip)
-                if (gptParts.isNotEmpty()) {
-                    _partitions.value = gptParts
-                    parts = gptParts
-                } else {
-                    addLog(TerminalLog(now(), "[-] [STORAGE UNINITIALIZED]: Device partition table could not be read. DA or Auth Bypass required for ${func.title}.", LogLevel.ERROR))
-                    _operationProgress.value = OperationProgress(isRunning = false, percentage = 0f)
-                    com.example.audio.ToolSoundManager.playOperationStop()
-                    return@launch
-                }
-            }
-            val autoReboot = _autoReboot.value
-            val autoNvBackup = _autoNvBackup.value
 
             _operationProgress.value = OperationProgress(
                 isRunning = true,
@@ -570,108 +537,63 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
 
             com.example.audio.ToolSoundManager.playOperationStart()
             try {
-                val res: Result<*>? = when (func) {
-                    ServiceFunction.READ_INFO -> {
-                        protocolEngine.executeBromHandshake(isSim)
-                    }
-                    ServiceFunction.WRITE_PARTITION -> {
-                        val part = parts.getOrNull(_selectedPartitionIndex.value)
-                        if (part != null) {
-                            protocolEngine.writePartition(part, null, isSim, autoNvBackup, autoReboot)
-                        } else {
-                            addLog(TerminalLog(now(), "Please select a valid partition to write.", LogLevel.ERROR))
-                            Result.failure<Boolean>(IllegalArgumentException("No partition selected"))
+                val res: Result<*>? = withContext(Dispatchers.IO) {
+                    when (func) {
+                        ServiceFunction.READ_INFO -> protocolEngine.executeBromHandshake()
+                        ServiceFunction.READ_PARTITION -> {
+                            parts.getOrNull(_selectedPartitionIndex.value)?.let { part ->
+                                protocolEngine.readPartition(part)
+                            } ?: Result.failure<String>(IllegalArgumentException("No partition selected"))
                         }
-                    }
-                    ServiceFunction.BATCH_FLASH -> {
-                        executeFlashOperation()
-                        null
-                    }
-                    ServiceFunction.READ_PARTITION -> {
-                        val part = parts.getOrNull(_selectedPartitionIndex.value)
-                        if (part != null) {
-                            protocolEngine.readPartition(part, isSim)
-                        } else {
-                            addLog(TerminalLog(now(), "Please select a valid partition to read.", LogLevel.ERROR))
-                            Result.failure<String>(IllegalArgumentException("No partition selected"))
+                        ServiceFunction.WRITE_PARTITION -> {
+                            parts.getOrNull(_selectedPartitionIndex.value)?.let { part ->
+                                val data = loadPartitionImageData(part)
+                                if (data != null) protocolEngine.writePartition(part, data, _autoNvBackup.value, _autoReboot.value)
+                                else Result.failure<Boolean>(IllegalArgumentException("No image file for ${part.partitionName}"))
+                            } ?: Result.failure<Boolean>(IllegalArgumentException("No partition selected"))
                         }
-                    }
-                    ServiceFunction.DUMP_ALL_PARTITIONS -> {
-                        protocolEngine.dumpAllPartitions(chip, parts, isSim)
-                    }
-                    ServiceFunction.DUMP_STABLE_PARTITIONS -> {
-                        protocolEngine.dumpStablePartitions(parts, isSim)
-                    }
-                    ServiceFunction.READ_PRELOADER -> {
-                        protocolEngine.readPreloader(isSim)
-                    }
-                    ServiceFunction.READ_GPT_SCATTER -> {
-                        protocolEngine.readGptAndGenerateScatter(chip, parts, isSim)
-                    }
-                    ServiceFunction.READ_RPMB -> {
-                        protocolEngine.readRpmb(isSim)
-                    }
-                    ServiceFunction.BACKUP_NVRAM -> {
-                        protocolEngine.backupNvram(chip, parts, isSim)
-                    }
-                    ServiceFunction.RESTORE_NVRAM -> {
-                        addLog(TerminalLog(now(), "Restoring saved NV calibration archive...", LogLevel.INFO))
-                        val nvPart = parts.find { it.partitionName.lowercase() == "nvdata" } ?: parts.getOrNull(2)
-                        if (nvPart != null) {
-                            protocolEngine.writePartition(nvPart, null, isSim, autoNvBackup = false, autoReboot = autoReboot)
-                        } else {
-                            Result.failure<Boolean>(IllegalStateException("No NV partition found"))
+                        ServiceFunction.DUMP_ALL_PARTITIONS -> protocolEngine.dumpAllPartitions(chip, parts)
+                        ServiceFunction.DUMP_STABLE_PARTITIONS -> protocolEngine.dumpStablePartitions(parts)
+                        ServiceFunction.READ_PRELOADER -> protocolEngine.readPreloader()
+                        ServiceFunction.READ_GPT_SCATTER -> protocolEngine.readGptAndGenerateScatter(chip, parts)
+                        ServiceFunction.READ_RPMB -> protocolEngine.readRpmb()
+                        ServiceFunction.BACKUP_NVRAM -> protocolEngine.backupNvram(chip, parts)
+                        ServiceFunction.RESTORE_NVRAM -> {
+                            parts.find { it.partitionName.lowercase() == "nvdata" }?.let { nv ->
+                                val data = loadPartitionImageData(nv)
+                                if (data != null) protocolEngine.writePartition(nv, data, autoNvBackup = false, autoReboot = _autoReboot.value)
+                                else Result.failure<Boolean>(IllegalArgumentException("No NV image file"))
+                            } ?: Result.failure<Boolean>(IllegalStateException("No NV partition found"))
                         }
-                    }
-                    ServiceFunction.BYPASS_AUTH -> {
-                        protocolEngine.bypassAuth(isSim)
-                    }
-                    ServiceFunction.UNLOCK_BOOTLOADER -> {
-                        protocolEngine.unlockBootloader(parts, isSim, autoReboot)
-                    }
-                    ServiceFunction.LOCK_BOOTLOADER -> {
-                        protocolEngine.lockBootloader(parts, isSim, autoReboot)
-                    }
-                    ServiceFunction.ERASE_FRP -> {
-                        protocolEngine.eraseFrp(chip, parts, isSim, autoNvBackup, autoReboot)
-                    }
-                    ServiceFunction.FACTORY_RESET -> {
-                        protocolEngine.factoryReset(chip, parts, isSim, autoNvBackup, autoReboot)
-                    }
-                    ServiceFunction.DISABLE_MI_ACCOUNT -> {
-                        protocolEngine.disableMiAccount(chip, parts, isSim, autoNvBackup, autoReboot)
-                    }
-                    ServiceFunction.MEMORY_TEST -> {
-                        protocolEngine.runMemoryTest(isSim)
-                    }
-                    ServiceFunction.FORMAT_PARTITION -> {
-                        val part = parts.getOrNull(_selectedPartitionIndex.value)
-                        if (part != null) {
-                            protocolEngine.formatPartition(chip, part, parts, isSim, autoNvBackup, autoReboot)
-                        } else {
-                            Result.failure<Boolean>(IllegalArgumentException("No partition selected"))
+                        ServiceFunction.BYPASS_AUTH -> protocolEngine.bypassAuth()
+                        ServiceFunction.UNLOCK_BOOTLOADER -> protocolEngine.unlockBootloader(parts, _autoReboot.value)
+                        ServiceFunction.LOCK_BOOTLOADER -> protocolEngine.lockBootloader(parts, _autoReboot.value)
+                        ServiceFunction.ERASE_FRP -> protocolEngine.eraseFrp(chip, parts, _autoNvBackup.value, _autoReboot.value)
+                        ServiceFunction.FACTORY_RESET -> protocolEngine.factoryReset(chip, parts, _autoNvBackup.value, _autoReboot.value)
+                        ServiceFunction.DISABLE_MI_ACCOUNT -> protocolEngine.disableMiAccount(chip, parts, _autoNvBackup.value, _autoReboot.value)
+                        ServiceFunction.MEMORY_TEST -> protocolEngine.runMemoryTest()
+                        ServiceFunction.FORMAT_PARTITION -> {
+                            parts.getOrNull(_selectedPartitionIndex.value)?.let { part ->
+                                protocolEngine.formatPartition(chip, part, parts, _autoNvBackup.value, _autoReboot.value)
+                            } ?: Result.failure<Boolean>(IllegalArgumentException("No partition selected"))
                         }
-                    }
-                    ServiceFunction.CRASH_TO_BROM -> {
-                        protocolEngine.crashToBrom(isSim)
-                    }
-                    ServiceFunction.REBOOT_SYSTEM -> {
-                        protocolEngine.rebootDevice("Android System", isSim)
-                    }
-                    ServiceFunction.REBOOT_FASTBOOT -> {
-                        protocolEngine.rebootDevice("Fastboot Mode", isSim)
-                    }
-                    ServiceFunction.REBOOT_RECOVERY -> {
-                        protocolEngine.rebootDevice("Recovery Mode", isSim)
+                        ServiceFunction.CRASH_TO_BROM -> protocolEngine.crashToBrom()
+                        ServiceFunction.REBOOT_SYSTEM -> protocolEngine.rebootDevice("Android System")
+                        ServiceFunction.REBOOT_FASTBOOT -> protocolEngine.rebootDevice("Fastboot Mode")
+                        ServiceFunction.REBOOT_RECOVERY -> protocolEngine.rebootDevice("Recovery Mode")
+                        ServiceFunction.BATCH_FLASH -> {
+                            // Direct call batchFlash without nested job
+                            if (parts.none { it.isSelectedForFlashing }) Result.failure<Boolean>(IllegalArgumentException("No partitions selected"))
+                            else protocolEngine.batchFlash(chip, parts, _autoNvBackup.value, _autoReboot.value)
+                        }
                     }
                 }
 
                 if (res != null) {
-                    if (res.isSuccess) {
-                        com.example.audio.ToolSoundManager.playOperationDone()
-                    } else {
+                    if (res.isSuccess) com.example.audio.ToolSoundManager.playOperationDone()
+                    else {
                         val err = res.exceptionOrNull()?.message ?: "Operation failed"
-                        addLog(TerminalLog(now(), "[-] [SERVICE FAIL]: ${func.title} failed: $err. Pipeline halted.", LogLevel.ERROR))
+                        addLog(TerminalLog(now(), "[-] [SERVICE FAIL]: ${func.title} failed: $err", LogLevel.ERROR))
                         com.example.audio.ToolSoundManager.playOperationStop()
                     }
                 }
@@ -688,13 +610,17 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun batchFlashSelectedPartitions() {
         viewModelScope.launch {
-            protocolEngine.batchFlash(_scatterPlatform.value, _partitions.value, _isDryRun.value, _autoNvBackup.value, _autoReboot.value)
+            withContext(Dispatchers.IO) {
+                protocolEngine.batchFlash(_scatterPlatform.value, _partitions.value, _autoNvBackup.value, _autoReboot.value)
+            }
         }
     }
 
     fun runBromHandshake() {
         viewModelScope.launch {
-            val result = protocolEngine.executeBromHandshake(_isDryRun.value)
+            val result = withContext(Dispatchers.IO) {
+                protocolEngine.executeBromHandshake()
+            }
             if (result.isSuccess) {
                 val info = result.getOrNull()!!
                 _chipInfo.value = info
@@ -703,8 +629,9 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
                 }
                 protocolEngine.validateChipMatch(info, _scatterPlatform.value)
 
-                // Read live device GPT from phone storage dynamically
-                val liveGpt = protocolEngine.readDeviceGpt(_isDryRun.value, info.chipIdHex)
+                val liveGpt = withContext(Dispatchers.IO) {
+                    protocolEngine.readDeviceGpt()
+                }
                 if (liveGpt.isNotEmpty()) {
                     _partitions.value = liveGpt
                     addLog(TerminalLog(now(), "Live Storage GPT Loaded into Partitions Table (${liveGpt.size} Partitions).", LogLevel.SUCCESS))
@@ -716,16 +643,16 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
     fun sendWatchdogReset() {
         viewModelScope.launch {
             addLog(TerminalLog(now(), "Sending USB Control Transfer Watchdog Reset...", LogLevel.INFO))
-            if (!_isDryRun.value && targetPhoneUsb.isConnected()) {
+            if (targetPhoneUsb.isConnected()) {
                 val ok = targetPhoneUsb.sendWatchdogResetControl()
-                addLog(TerminalLog(now(), "USB Control Transfer Reset: ${if (ok) "SUCCESS" else "SENT"}", LogLevel.SUCCESS))
+                addLog(TerminalLog(now(), "USB Control Transfer Reset: ${if (ok) "SUCCESS" else "FAILED"}", LogLevel.SUCCESS))
             } else {
-                addLog(TerminalLog(now(), "Simulated USB Watchdog Reset Triggered.", LogLevel.SUCCESS))
+                addLog(TerminalLog(now(), "No device connected for watchdog reset.", LogLevel.WARNING))
             }
         }
     }
 
-    // ADB & Fastboot state
+    // ADB & Fastboot states
     private val _adbDeviceInfo = MutableStateFlow<String>("")
     val adbDeviceInfo: StateFlow<String> = _adbDeviceInfo.asStateFlow()
 
@@ -743,54 +670,38 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
             _isAdbBusy.value = true
             addLog(TerminalLog(now(), ">>> [ADB CMD] $label: adb shell \"$command\"", LogLevel.INFO))
             val dev = targetPhoneUsb.currentDevice
-            if (dev == null && !_isDryRun.value) {
-                addLog(TerminalLog(now(), "[-] ADB Error: No USB Device connected. Please connect with USB Debugging enabled.", LogLevel.ERROR))
+            if (dev == null) {
+                addLog(TerminalLog(now(), "[-] ADB Error: No USB Device connected.", LogLevel.ERROR))
                 _isAdbBusy.value = false
                 return@launch
             }
 
-            if (_isDryRun.value || dev == null) {
-                // Dry run response
-                kotlinx.coroutines.delay(600)
-                val mockOutput = when {
-                    command.contains("getprop ro.product.model") -> "Redmi Note 12 Pro (MT6877)"
-                    command.contains("getprop") -> "[ro.product.model]: [Redmi Note 12 Pro]\n[ro.build.version.release]: [13]\n[ro.build.version.security_patch]: [2024-05-01]\n[ro.board.platform]: [mt6877]"
-                    command.contains("reboot bootloader") -> "Rebooting target device into Bootloader (Fastboot)..."
-                    command.contains("reboot recovery") -> "Rebooting target device into Recovery..."
-                    command.contains("reboot") -> "Device reboot signal sent."
-                    command.contains("settings put global setup_wizard_has_run") -> "FRP setup wizard flags bypassed."
-                    else -> "Success: Command executed."
+            withContext(Dispatchers.IO) {
+                val client = com.example.protocol.AdbProtocolClient(targetPhoneUsb.usbManager, dev)
+                val opened = client.open()
+                if (!opened) {
+                    addLog(TerminalLog(now(), "[-] ADB Error: Failed to open USB ADB Interface.", LogLevel.ERROR))
+                    _isAdbBusy.value = false
+                    return@withContext
                 }
-                addLog(TerminalLog(now(), "[ADB Response]\n$mockOutput", LogLevel.SUCCESS))
-                onComplete?.invoke(mockOutput)
+
+                val connected = client.connect()
+                if (!connected) {
+                    addLog(TerminalLog(now(), "[!] ADB Warning: Handshake not accepted. Check phone screen.", LogLevel.WARNING))
+                }
+
+                val output = client.executeShell(command)
+                client.close()
+
+                if (output.isNotBlank()) {
+                    addLog(TerminalLog(now(), "[ADB Response]\n$output", LogLevel.SUCCESS))
+                    onComplete?.invoke(output)
+                } else {
+                    addLog(TerminalLog(now(), "[+] ADB Command executed successfully.", LogLevel.SUCCESS))
+                    onComplete?.invoke("OK")
+                }
                 _isAdbBusy.value = false
-                return@launch
             }
-
-            val client = com.example.protocol.AdbProtocolClient(targetPhoneUsb.usbManager, dev)
-            val opened = client.open()
-            if (!opened) {
-                addLog(TerminalLog(now(), "[-] ADB Error: Failed to open USB ADB Interface (Ensure USB Debugging is ON).", LogLevel.ERROR))
-                _isAdbBusy.value = false
-                return@launch
-            }
-
-            val connected = client.connect()
-            if (!connected) {
-                addLog(TerminalLog(now(), "[!] ADB Warning: ADB Handshake not accepted. Check phone screen for Authorization prompt.", LogLevel.WARNING))
-            }
-
-            val output = client.executeShell(command)
-            client.close()
-
-            if (output.isNotBlank()) {
-                addLog(TerminalLog(now(), "[ADB Response]\n$output", LogLevel.SUCCESS))
-                onComplete?.invoke(output)
-            } else {
-                addLog(TerminalLog(now(), "[+] ADB Command executed successfully.", LogLevel.SUCCESS))
-                onComplete?.invoke("OK")
-            }
-            _isAdbBusy.value = false
         }
     }
 
@@ -831,51 +742,35 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
             _isFastbootBusy.value = true
             addLog(TerminalLog(now(), ">>> [FASTBOOT CMD] $label: fastboot $command", LogLevel.INFO))
             val dev = targetPhoneUsb.currentDevice
-            if (dev == null && !_isDryRun.value) {
-                addLog(TerminalLog(now(), "[-] Fastboot Error: No USB Device connected in Fastboot mode.", LogLevel.ERROR))
+            if (dev == null) {
+                addLog(TerminalLog(now(), "[-] Fastboot Error: No USB Device connected.", LogLevel.ERROR))
                 _isFastbootBusy.value = false
                 return@launch
             }
 
-            if (_isDryRun.value || dev == null) {
-                kotlinx.coroutines.delay(600)
-                val mockResult = when {
-                    command.contains("getvar:all") || command.contains("getvar all") -> 
-                        "product: ruby_pro\nversion-bootloader: MT6877_V1.0\nsecure: yes\nunlocked: no\noff-mode-charge: 1\ncharger-screen-enabled: 1\nbattery-voltage: 4120mV"
-                    command.contains("unlock") -> "OKAY [ 0.054s ]\nUnlocked bootloader successfully."
-                    command.contains("lock") -> "OKAY [ 0.048s ]\nLocked bootloader successfully."
-                    command.contains("erase frp") -> "Erasing 'frp' ... OKAY [ 0.012s ]\nFinished."
-                    command.contains("erase userdata") -> "Erasing 'userdata' ... OKAY [ 0.231s ]\nFinished."
-                    command.contains("reboot") -> "Rebooting device ... OKAY"
-                    else -> "OKAY [ 0.020s ]"
+            withContext(Dispatchers.IO) {
+                val client = com.example.protocol.FastbootProtocolClient(targetPhoneUsb.usbManager, dev)
+                val opened = client.open()
+                if (!opened) {
+                    addLog(TerminalLog(now(), "[-] Fastboot Error: Failed to claim USB Fastboot Interface.", LogLevel.ERROR))
+                    _isFastbootBusy.value = false
+                    return@withContext
                 }
-                addLog(TerminalLog(now(), "[Fastboot Output]\n$mockResult", LogLevel.SUCCESS))
-                onComplete?.invoke(mockResult)
+
+                val res = client.executeCommand(command)
+                client.close()
+
+                if (res.isSuccess) {
+                    val output = res.info.ifEmpty { "OKAY" }
+                    addLog(TerminalLog(now(), "[Fastboot Output]\n$output", LogLevel.SUCCESS))
+                    onComplete?.invoke(output)
+                } else {
+                    val err = res.error.ifEmpty { res.info.ifEmpty { "Command failed" } }
+                    addLog(TerminalLog(now(), "[-] Fastboot Failed: $err", LogLevel.ERROR))
+                    onComplete?.invoke("ERROR: $err")
+                }
                 _isFastbootBusy.value = false
-                return@launch
             }
-
-            val client = com.example.protocol.FastbootProtocolClient(targetPhoneUsb.usbManager, dev)
-            val opened = client.open()
-            if (!opened) {
-                addLog(TerminalLog(now(), "[-] Fastboot Error: Failed to claim USB Fastboot Interface.", LogLevel.ERROR))
-                _isFastbootBusy.value = false
-                return@launch
-            }
-
-            val res = client.executeCommand(command)
-            client.close()
-
-            if (res.isSuccess) {
-                val output = res.info.ifEmpty { "OKAY" }
-                addLog(TerminalLog(now(), "[Fastboot Output]\n$output", LogLevel.SUCCESS))
-                onComplete?.invoke(output)
-            } else {
-                val err = res.error.ifEmpty { res.info.ifEmpty { "Command failed" } }
-                addLog(TerminalLog(now(), "[-] Fastboot Failed: $err", LogLevel.ERROR))
-                onComplete?.invoke("ERROR: $err")
-            }
-            _isFastbootBusy.value = false
         }
     }
 
@@ -885,21 +780,10 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun runFastbootUnlockBootloader() {
-        runFastbootCommand("Flashing Unlock", "flashing unlock")
-    }
-
-    fun runFastbootLockBootloader() {
-        runFastbootCommand("Flashing Lock", "flashing lock")
-    }
-
-    fun runFastbootEraseFrp() {
-        runFastbootCommand("Erase FRP Partition", "erase:frp")
-    }
-
-    fun runFastbootFormatUserdata() {
-        runFastbootCommand("Format Userdata (Wipe)", "erase:userdata")
-    }
+    fun runFastbootUnlockBootloader() = runFastbootCommand("Flashing Unlock", "flashing unlock")
+    fun runFastbootLockBootloader() = runFastbootCommand("Flashing Lock", "flashing lock")
+    fun runFastbootEraseFrp() = runFastbootCommand("Erase FRP Partition", "erase:frp")
+    fun runFastbootFormatUserdata() = runFastbootCommand("Format Userdata (Wipe)", "erase:userdata")
 
     fun runFastbootReboot(mode: String) {
         val cmd = when (mode.lowercase()) {
@@ -912,37 +796,5 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         runFastbootCommand("Reboot to ${mode.uppercase()}", cmd)
     }
 
-    fun requestAiDiagnosis() {
-        viewModelScope.launch {
-            _isAiLoading.value = true
-            addLog(TerminalLog(now(), "Requesting Gemini AI Diagnostic Analysis...", LogLevel.INFO))
-            val recentLogs = _logs.value.takeLast(20).joinToString("\n") { "[${it.timestamp}] ${it.message}" }
-            val selectedPart = _partitions.value.getOrNull(_selectedPartitionIndex.value)?.partitionName ?: "nvram"
-            val diagnosis = aiAdvisor.analyzeMtkLogsAndSuggestFix(
-                chipInfo = _chipInfo.value.chipIdHex,
-                scatterPlatform = _scatterPlatform.value,
-                recentLogs = recentLogs,
-                selectedPartition = selectedPart
-            )
-            _aiAnalysis.value = diagnosis
-            _isAiLoading.value = false
-            addLog(TerminalLog(now(), "Gemini AI Diagnosis received.", LogLevel.AI))
-        }
-    }
-
-    fun requestAiDiagnostics() {
-        requestAiDiagnosis()
-    }
-
-    fun requestAiLogAnalysis() {
-        requestAiDiagnosis()
-    }
-
-    fun toggleAllPartitions(selectAll: Boolean) {
-        selectAllPartitions(selectAll)
-    }
-
-    fun dismissAiSheet() {
-        _aiAnalysis.value = null
-    }
+    fun toggleAllPartitions(selectAll: Boolean) = selectAllPartitions(selectAll)
 }
