@@ -1,4 +1,4 @@
-mpackage com.example.protocol
+package com.example.protocol
 
 import android.content.Context
 import com.example.model.LogLevel
