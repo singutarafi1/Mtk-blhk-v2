@@ -42,9 +42,6 @@ class MtkBromProtocolEngine(
         const val CMD_GET_ME_ID: Byte = 0xE1.toByte()
         const val CMD_GET_SOC_ID: Byte = 0xE7.toByte()
         const val CMD_GET_TARGET_CONFIG: Byte = 0xD8.toByte()
-
-        val HANDSHAKE_SEQ = byteArrayOf(0xA0.toByte(), 0x0A.toByte(), 0x50.toByte(), 0x05.toByte())
-        val HANDSHAKE_REPLY = byteArrayOf(0x5F.toByte(), 0xF5.toByte(), 0xAF.toByte(), 0xFA.toByte())
     }
 
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
@@ -184,7 +181,7 @@ class MtkBromProtocolEngine(
     private suspend fun ensureDaReady(): Boolean {
         if (daLoaded && xflashEngine != null) return true
 
-        // 1. Establish initial BROM Connection
+        // 1. Check BROM Connection
         val isReady = ensureTargetConnected()
         if (!isReady || !targetPhoneUsb.isConnected()) {
             log("[-] DA Load failed: Device not connected.", LogLevel.ERROR)
@@ -221,32 +218,35 @@ class MtkBromProtocolEngine(
             log("[-] Security Bypass Warning: ${bypassRes.exceptionOrNull()?.message}", LogLevel.WARNING)
         }
 
-        // 5. Load DA payload from assets
-        var daBytes = MtkAssetManager.resolveDaForChip(context, chipConfig)
-            ?: MtkAssetManager.loadDaBytes(context, "MTK_DA_V5.bin")
+        // 5. Load Real DA Container (Exclude small payload binaries)
+        var daBytes = MtkAssetManager.loadDaBytes(context, "MTK_DA_V5.bin")
+            ?: MtkAssetManager.loadDaBytes(context, "MTK_DA_V6.bin")
             ?: MtkAssetManager.loadDaBytes(context, "MTK_AllInOne_DA.bin")
+            ?: MtkAssetManager.resolveDaForChip(context, chipConfig)
 
-        if (daBytes == null || daBytes.size < 32) {
-            log("[-] No valid DA found for ${chipConfig.name}", LogLevel.ERROR)
+        if (daBytes == null || daBytes.size < 4096) {
+            log("[-] No valid full DA container binary found for ${chipConfig.name} (Must be > 4KB).", LogLevel.ERROR)
             return false
         }
 
         // 6. Parse DA container
         val daInfo = MtkDaParser.parseDaLoader(daBytes, hwCode, defaultLoadAddr = chipConfig.daPayloadAddr)
         if (daInfo == null) {
-            log("[-] Failed to parse DA binary.", LogLevel.ERROR)
+            log("[-] Failed to parse DA binary container.", LogLevel.ERROR)
             return false
         }
 
         val stage1Bytes = daInfo.getStage1Bytes()
         if (stage1Bytes == null || stage1Bytes.isEmpty()) {
-            log("[-] DA Stage 1 region missing.", LogLevel.ERROR)
+            log("[-] DA Stage 1 region missing in container.", LogLevel.ERROR)
             return false
         }
 
-        // Ensure Stage 1 loads into SRAM, not DRAM
+        // Enforce valid SRAM load address for Stage 1 (0x201000)
         val rawStartAddr = daInfo.stage1?.startAddress ?: chipConfig.daPayloadAddr
-        val daAddress1 = if (rawStartAddr >= 0x80000000L) chipConfig.daPayloadAddr else rawStartAddr
+        val daAddress1 = if (rawStartAddr >= 0x80000000L || rawStartAddr == 0L) chipConfig.daPayloadAddr else rawStartAddr
+
+        log("[DA READY] Stage 1 Binary Size: ${stage1Bytes.size} bytes | Target Address: 0x%08X".format(daAddress1), LogLevel.INFO)
 
         // 7. Upload DA Stage 1
         val uploadResult = MtkDaUploader.sendDa(
@@ -285,9 +285,9 @@ class MtkBromProtocolEngine(
         }
 
         // 9. Wait for Stage 1 sync (0xC0)
-        delay(100)
+        delay(150)
         val syncByte = ByteArray(1)
-        val readSync = targetPhoneUsb.readRaw(syncByte, 2000)
+        val readSync = targetPhoneUsb.readRaw(syncByte, 3000)
         if (readSync <= 0 || syncByte[0] != 0xC0.toByte()) {
             val syncHex = if (readSync > 0) "0x%02X".format(syncByte[0]) else "timeout"
             log("[-] DA Stage 1 sync failed. Expected 0xC0, got $syncHex.", LogLevel.ERROR)
