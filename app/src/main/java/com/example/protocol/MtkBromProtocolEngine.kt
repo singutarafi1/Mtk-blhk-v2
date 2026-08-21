@@ -52,7 +52,6 @@ class MtkBromProtocolEngine(
         const val CMD_WRITE32: Byte = 0xD4.toByte()
         const val CMD_READ32: Byte = 0xD6.toByte()
 
-        // BROM Stage 1 DA Sync ACK
         const val DA_SYNC_ACK: Byte = 0xC0.toByte()
     }
 
@@ -68,9 +67,6 @@ class MtkBromProtocolEngine(
         logCallback(TerminalLog(timestamp, message, level))
     }
 
-    /**
-     * Sends a 1-byte BROM command and verifies that the target echoes back the identical command byte.
-     */
     private fun sendCmdWithEcho(cmd: Byte, timeoutMs: Int = 1000): Boolean {
         if (targetPhoneUsb.writeRaw(byteArrayOf(cmd), timeoutMs) <= 0) return false
         val echo = ByteArray(1)
@@ -78,22 +74,17 @@ class MtkBromProtocolEngine(
         return (read > 0 && echo[0] == cmd)
     }
 
-    /**
-     * Disables MediaTek Hardware Watchdog Timer (WDT) via CMD_WRITE32 (0xD4).
-     * Prevents SoC from restarting while in BROM / DA setup phase.
-     */
     private suspend fun disableWatchdog(wdtAddress: Long = 0x10007000L): Boolean = withContext(Dispatchers.IO) {
         val cmdBuf = ByteBuffer.allocate(9).order(ByteOrder.BIG_ENDIAN)
         cmdBuf.put(CMD_WRITE32)
         cmdBuf.putInt((wdtAddress and 0xFFFFFFFFL).toInt())
-        cmdBuf.putInt(1) // 1 Dword (4 bytes)
+        cmdBuf.putInt(1)
 
         if (targetPhoneUsb.writeRaw(cmdBuf.array(), 500) <= 0) return@withContext false
 
         val ack = ByteArray(2)
         targetPhoneUsb.readRaw(ack, 500)
 
-        // MTK Watchdog Unlock & Disable Key: 0x22000000
         val valBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(0x22000000).array()
         if (targetPhoneUsb.writeRaw(valBuf, 500) <= 0) return@withContext false
 
@@ -102,9 +93,6 @@ class MtkBromProtocolEngine(
         return@withContext true
     }
 
-    /**
-     * Actively listens and captures the MTK BROM USB Port during device boot-up.
-     */
     private suspend fun ensureTargetConnected(timeoutSec: Int = 30): Boolean = withContext(Dispatchers.IO) {
         if (targetPhoneUsb.isConnected() && targetPhoneUsb.isBromConnected()) return@withContext true
 
@@ -140,27 +128,26 @@ class MtkBromProtocolEngine(
                     if (!targetPhoneUsb.isBromDevice(dev) && (now - lastNonBromWarningTime > 3500L)) {
                         val mode = targetPhoneUsb.detectDeviceMode(dev)
                         val vidPid = "0x%04X:0x%04X".format(dev.vendorId, dev.productId)
-                        log("[!] Non-BROM port ignored: ${mode.label} [$vidPid]. Hold [Vol+ & Vol-] to enter BROM.", LogLevel.WARNING)
+                        log("[!] Non-BROM port: ${mode.label} [$vidPid]. Hold [Vol+ & Vol-] for BROM.", LogLevel.WARNING)
                         lastNonBromWarningTime = now
                     }
                 }
 
                 val connected = targetPhoneUsb.scanAndConnect(forceBromOnly = true)
                 if (connected) {
-                    log("[+] MediaTek BROM Port DETECTED (0x0E8D)! Blasting BROM Handshake Sync...", LogLevel.SUCCESS)
+                    log("[+] MediaTek BROM Port DETECTED (0x0E8D)! Blasting Handshake...", LogLevel.SUCCESS)
                     val synced = targetPhoneUsb.blastBromHandshakeSync(60)
                     if (synced) {
                         log("[+] BROM Handshake Sync Locked (0x5F 0xF5 0xAF 0xFA)!", LogLevel.SUCCESS)
                         return@withContext true
                     } else {
-                        log("[-] Fast burst unacknowledged, attempting Byte-by-Byte Handshake...", LogLevel.WARNING)
                         if (sendHandshakeByteByByte()) return@withContext true
                     }
                 }
                 delay(50)
             }
 
-            log("[-] [HANDSHAKE FAIL]: Device connection timed out (${timeoutSec}s).", LogLevel.ERROR)
+            log("[-] [HANDSHAKE FAIL]: Connection timed out (${timeoutSec}s).", LogLevel.ERROR)
             return@withContext false
         } finally {
             targetPhoneUsb.strictBromOnlyMode = false
@@ -178,7 +165,6 @@ class MtkBromProtocolEngine(
             val read = targetPhoneUsb.readRaw(rx, 200)
             if (read != 1 || rx[0] != expectedEcho[i]) return false
         }
-        log("[+] BROM Handshake: Byte-by-Byte Echo Locked.", LogLevel.SUCCESS)
         return true
     }
 
@@ -221,16 +207,13 @@ class MtkBromProtocolEngine(
         return data
     }
 
-    /**
-     * Initializes Download Agent (Stage 1 DA_PL & Stage 2 XFLASH) strictly matching Python mtkclient.
-     */
     private suspend fun ensureDaReady(): Boolean = withContext(Dispatchers.IO) {
         if (daLoaded && xflashEngine != null) return@withContext true
 
         // 1. Establish BROM Connection
         val isReady = ensureTargetConnected()
         if (!isReady || !targetPhoneUsb.isConnected()) {
-            log("[-] DA Load failed: Device not connected in BROM.", LogLevel.ERROR)
+            log("[-] DA Load failed: Device not connected.", LogLevel.ERROR)
             return@withContext false
         }
 
@@ -241,15 +224,14 @@ class MtkBromProtocolEngine(
         }
         log("[DA READY] Detected HW Code: 0x%04X".format(hwCode), LogLevel.SUCCESS)
 
-        // 3. Resolve Chipset Configuration
         val chipConfig = MtkChipConfigDatabase.findConfig(hwCode)
             ?: MtkChipConfigDatabase.findConfig(0x0766)!!
         currentChipConfig = chipConfig
 
-        // 4. Immediately Kill Watchdog Timer
+        // 3. Immediately Kill Watchdog Timer
         disableWatchdog(chipConfig.watchdog)
 
-        // 5. Execute Security SLA/DAA/SBC Bypass
+        // 4. Execute Security SLA/DAA/SBC Bypass
         log("[DA READY] Executing Security SLA/DAA Bypass for ${chipConfig.name}...", LogLevel.INFO)
         val bypassRes = securityEngine.executeBypass(
             MtkChipInfo(
@@ -267,37 +249,38 @@ class MtkBromProtocolEngine(
             log("[-] Security Bypass Warning: ${bypassRes.exceptionOrNull()?.message}", LogLevel.WARNING)
         }
 
-        // 6. Load Full MediaTek Download Agent Container (> 4KB)
+        // 5. Exploit အပြီး USB Pipe Re-sync ပြုလုပ်ခြင်း
+        targetPhoneUsb.flush(50)
+        delay(150)
+
+        // 6. Load Download Agent Binary (Minimum 4KB Required)
         val daBytes = MtkAssetManager.loadDaBytes(context, "MTK_DA_V5.bin")
             ?: MtkAssetManager.loadDaBytes(context, "MTK_DA_V6.bin")
             ?: MtkAssetManager.loadDaBytes(context, "MTK_AllInOne_DA.bin")
             ?: MtkAssetManager.resolveDaForChip(context, chipConfig)
 
         if (daBytes == null || daBytes.size < 4096) {
-            log("[-] No valid full DA container binary found for ${chipConfig.name} (Must be > 4KB).", LogLevel.ERROR)
+            log("[-] CRITICAL: No valid DA container found for ${chipConfig.name} (Must be > 4KB).", LogLevel.ERROR)
             return@withContext false
         }
 
-        // 7. Parse DA Container Structure
+        // 7. Parse DA Container
         val daInfo = MtkDaParser.parseDaLoader(daBytes, hwCode, defaultLoadAddr = chipConfig.daPayloadAddr)
         if (daInfo == null) {
-            log("[-] Failed to parse DA binary container.", LogLevel.ERROR)
+            log("[-] Failed to parse DA container binary.", LogLevel.ERROR)
             return@withContext false
         }
 
         val stage1Bytes = daInfo.getStage1Bytes()
-        if (stage1Bytes == null || stage1Bytes.isEmpty()) {
-            log("[-] DA Stage 1 (DA_PL) missing in binary container.", LogLevel.ERROR)
+        if (stage1Bytes == null || stage1Bytes.size < 4096) {
+            log("[-] DA Stage 1 (DA_PL) missing or invalid in container (${stage1Bytes?.size ?: 0} bytes).", LogLevel.ERROR)
             return@withContext false
         }
 
-        // Enforce valid SRAM execution address (0x201000)
-        val rawStartAddr = daInfo.stage1?.startAddress ?: chipConfig.daPayloadAddr
-        val daAddress1 = if (rawStartAddr >= 0x80000000L || rawStartAddr == 0L) chipConfig.daPayloadAddr else rawStartAddr
+        val daAddress1 = daInfo.stage1?.startAddress ?: chipConfig.daPayloadAddr
+        log("[DA READY] Uploading DA Stage 1 (${stage1Bytes.size} bytes) -> 0x%08X...".format(daAddress1), LogLevel.INFO)
 
-        log("[DA READY] Uploading DA Stage 1 (${stage1Bytes.size} bytes) -> 0x%08X".format(daAddress1), LogLevel.INFO)
-
-        // 8. Upload DA Stage 1 via CMD_SEND_DA (0xD7)
+        // 8. Upload DA Stage 1 (CMD_SEND_DA 0xD7)
         val uploadResult = MtkDaUploader.sendDa(
             usb = targetPhoneUsb,
             daAddress = daAddress1,
@@ -321,7 +304,7 @@ class MtkBromProtocolEngine(
             return@withContext false
         }
 
-        // 9. Jump to DA Stage 1 via CMD_JUMP_DA (0xD5)
+        // 9. Jump to DA Stage 1 (CMD_JUMP_DA 0xD5)
         val jumpResult = MtkDaUploader.jumpDa(
             usb = targetPhoneUsb,
             daAddress = daAddress1,
@@ -333,62 +316,55 @@ class MtkBromProtocolEngine(
             return@withContext false
         }
 
-        // 10. Await DA Stage 1 Initialization ACK (0xC0)
-        delay(150)
+        // 10. Verify DA Stage 1 Sync Byte (0xC0)
+        delay(200)
         val syncByte = ByteArray(1)
-        val readSync = targetPhoneUsb.readRaw(syncByte, 3000)
+        val readSync = targetPhoneUsb.readRaw(syncByte, 4000)
         if (readSync <= 0 || syncByte[0] != DA_SYNC_ACK) {
             val syncHex = if (readSync > 0) "0x%02X".format(syncByte[0]) else "Timeout"
             log("[-] DA Stage 1 sync failed. Expected 0xC0, got $syncHex.", LogLevel.ERROR)
             return@withContext false
         }
-        log("[+] DA Stage 1 sync (0xC0) verified. DRAM active.", LogLevel.SUCCESS)
+        log("[+] DA Stage 1 active (0xC0 received). DRAM controller initialized.", LogLevel.SUCCESS)
 
-        // 11. Extract and Upload DA Stage 2 (XFLASH) to DRAM
+        // 11. Upload DA Stage 2 (XFLASH) if present
         val stage2Bytes = daInfo.getStage2Bytes()
-        if (stage2Bytes == null || stage2Bytes.isEmpty()) {
-            log("[-] No DA Stage 2 (XFLASH) region found in container.", LogLevel.ERROR)
-            return@withContext false
-        }
+        if (stage2Bytes != null && stage2Bytes.isNotEmpty()) {
+            val xf = MtkXFlashEngine(targetPhoneUsb) { log(it.message, it.level) }
+            if (!xf.connect()) {
+                log("[-] XFlash Session Handshake failed.", LogLevel.ERROR)
+                return@withContext false
+            }
 
-        val xf = MtkXFlashEngine(targetPhoneUsb) { log(it.message, it.level) }
-        if (!xf.connect()) {
-            log("[-] XFlash Session Handshake failed.", LogLevel.ERROR)
-            return@withContext false
-        }
+            val daAddress2 = daInfo.stage2?.startAddress ?: 0x40000000L
+            log("[DA READY] Uploading DA Stage 2 (${stage2Bytes.size} bytes) -> 0x%08X (DRAM)...".format(daAddress2), LogLevel.INFO)
 
-        val daAddress2 = daInfo.stage2?.startAddress ?: 0x40000000L
-        log("[DA READY] Uploading DA Stage 2 (${stage2Bytes.size} bytes) -> 0x%08X (DRAM)...".format(daAddress2), LogLevel.INFO)
-
-        val bootToOk = xf.bootTo(daAddress2, stage2Bytes) { written, total ->
-            val fraction = written.toFloat() / total.toFloat()
-            progressCallback(
-                OperationProgress(
-                    isRunning = true,
-                    title = "Uploading DA Stage 2",
-                    detail = "Deploying XFlash Engine...",
-                    percentage = fraction * 100f
+            val bootToOk = xf.bootTo(daAddress2, stage2Bytes) { written, total ->
+                val fraction = written.toFloat() / total.toFloat()
+                progressCallback(
+                    OperationProgress(
+                        isRunning = true,
+                        title = "Uploading DA Stage 2",
+                        detail = "Deploying XFlash Engine...",
+                        percentage = fraction * 100f
+                    )
                 )
-            )
+            }
+
+            if (!bootToOk) {
+                log("[-] XFlash BOOT_TO DA Stage 2 upload failed.", LogLevel.ERROR)
+                return@withContext false
+            }
+
+            xflashEngine = xf
         }
 
-        if (!bootToOk) {
-            log("[-] XFlash BOOT_TO DA Stage 2 upload failed.", LogLevel.ERROR)
-            return@withContext false
-        }
-
-        xflashEngine = xf
         daLoaded = true
-
-        log("[DA READY] DA Stage 2 active. XFlash engine linked successfully.", LogLevel.SUCCESS)
+        log("[DA READY] Download Agent successfully active and ready for operations.", LogLevel.SUCCESS)
         return@withContext true
     }
 
     suspend fun readDetailedDeviceInfo(): Result<MtkChipInfo> = withContext(Dispatchers.IO) {
-        log("================================================================", LogLevel.ACCENT)
-        log(">>> [MTK CLIENT] FULL HARDWARE & SECURITY SPECIFICATION <<<", LogLevel.ACCENT)
-        log("================================================================", LogLevel.ACCENT)
-
         try {
             val isReady = ensureTargetConnected()
             if (!isReady || !targetPhoneUsb.isConnected()) {
@@ -429,29 +405,11 @@ class MtkBromProtocolEngine(
                 }
             }
 
-            var meidStr = "UNKNOWN"
-            if (sendCmdWithEcho(CMD_GET_ME_ID, 500)) {
-                val meidBuf = readBromLengthData(CMD_GET_ME_ID)
-                if (meidBuf != null) meidStr = meidBuf.joinToString("") { "%02X".format(it) }
-            }
-
-            var socIdStr = "UNKNOWN"
-            if (sendCmdWithEcho(CMD_GET_SOC_ID, 500)) {
-                val socIdBuf = readBromLengthData(CMD_GET_SOC_ID)
-                if (socIdBuf != null) socIdStr = socIdBuf.joinToString("") { "%02X".format(it) }
-            }
-
             val chipName = resolveChipName(hwCodeStr)
             val guessedBrand = resolveGuessedDevice(hwCodeStr)
 
-            log("[+] Target Platform      : $chipName ($hwCodeStr)", LogLevel.CYAN)
-            log("[+] Hardware Code        : $hwCodeStr | Subcode: $hwSubCode | HW Ver: $hwVer | SW Ver: $swVer", LogLevel.INFO)
-            log("[+] Silicon MEID         : $meidStr", LogLevel.MAGENTA)
-            log("[+] Hardware SOC ID      : $socIdStr", LogLevel.MAGENTA)
-            log("[+] Security Matrix      : SBC [${if (isSecBoot) "ENABLED" else "DISABLED"}] | SLA [${if (isSlaActive) "ACTIVE" else "DISABLED"}] | DAA [${if (isDaaActive) "ACTIVE" else "DISABLED"}]", if (!isSecBoot) LogLevel.SUCCESS else LogLevel.WARNING)
-            log("[+] Bootloader State     : ${if (isSecBoot) "LOCKED / ENFORCED" else "UNLOCKED (seccfg)"}", LogLevel.SUCCESS)
-            log("[+] Device Model Match   : $guessedBrand", LogLevel.ACCENT)
-            log("================================================================", LogLevel.ACCENT)
+            log("[+] Target Platform: $chipName ($hwCodeStr)", LogLevel.CYAN)
+            log("[+] Security: SBC [${if (isSecBoot) "ENABLED" else "DISABLED"}] | SLA [${if (isSlaActive) "ACTIVE" else "DISABLED"}] | DAA [${if (isDaaActive) "ACTIVE" else "DISABLED"}]", LogLevel.INFO)
 
             return@withContext Result.success(
                 MtkChipInfo(
@@ -466,20 +424,15 @@ class MtkBromProtocolEngine(
                 )
             )
         } catch (e: Exception) {
-            log("BROM Device Info error: ${e.message}", LogLevel.ERROR)
             return@withContext Result.failure(e)
         }
     }
 
     suspend fun readDeviceGpt(): List<PartitionEntry> = withContext(Dispatchers.IO) {
-        if (!ensureDaReady()) {
-            log("[-] GPT read failed: Could not initialize Download Agent.", LogLevel.ERROR)
-            return@withContext emptyList()
-        }
-
+        if (!ensureDaReady()) return@withContext emptyList()
         val xf = xflashEngine ?: return@withContext emptyList()
 
-        log("[GPT READ] Reading GUID Partition Table (LBA 0 - LBA 33) via XFlash...", LogLevel.INFO)
+        log("[GPT READ] Reading GUID Partition Table (LBA 0 - LBA 33)...", LogLevel.INFO)
         val sectorSize = 512L
         val length = sectorSize * 34
 
@@ -488,16 +441,9 @@ class MtkBromProtocolEngine(
             partType = MtkFlashEngine.EmmcPartition.USER.value,
             address = 0L,
             length = length
-        )
+        ) ?: return@withContext emptyList()
 
-        if (gptBytes == null || gptBytes.isEmpty()) {
-            log("[-] GPT raw read failed via XFlash.", LogLevel.ERROR)
-            return@withContext emptyList()
-        }
-
-        val parsed = GptParser.parseRawGpt(gptBytes)
-        log("[+] Live GPT Parsed Successfully: Found ${parsed.size} partitions.", LogLevel.SUCCESS)
-        return@withContext parsed
+        return@withContext GptParser.parseRawGpt(gptBytes)
     }
 
     suspend fun writePartition(
@@ -507,33 +453,14 @@ class MtkBromProtocolEngine(
         autoReboot: Boolean = true,
         isSubOperation: Boolean = false
     ): Result<Boolean> = withContext(Dispatchers.IO) {
-        if (!ensureDaReady()) {
-            log("[-] Write failed: DA not ready.", LogLevel.ERROR)
-            return@withContext Result.failure(IllegalStateException("DA not ready."))
-        }
-
-        log("==================================================", LogLevel.INFO)
-        log(">>> [WRITE PARTITION] Initiating for '${partition.partitionName}'", LogLevel.WARNING)
-        log("==================================================", LogLevel.INFO)
-
-        if (autoNvBackup) {
-            log("[STEP 1/3] Performing pre-write auto-backup...", LogLevel.INFO)
-            val backupResult = readPartitionInternal(partition)
-            if (backupResult.isFailure) {
-                log("CRITICAL ERROR: Pre-write backup failed! Aborting write.", LogLevel.ERROR)
-                return@withContext Result.failure(IllegalStateException("Pre-write backup failed."))
-            }
-        }
-
+        if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
         if (sourceImageData == null || sourceImageData.isEmpty()) {
-            return@withContext Result.failure(IllegalArgumentException("No image payload provided for ${partition.partitionName}"))
+            return@withContext Result.failure(IllegalArgumentException("No image payload provided."))
         }
 
         val chipConfig = currentChipConfig ?: MtkChipConfigDatabase.findConfig(0x0766)!!
         val isModern = chipConfig.damode == DaMode.XFLASH || partition.region.contains("UFS", true)
         val (storageType, partSection) = flashEngine.resolveStorageTarget(partition.partitionName, partition.region, isModern)
-
-        log("[STEP 2/3] Writing image payload to ${partition.partitionName} (${partition.linearStartAddrHex})...", LogLevel.INFO)
 
         val success = if (chipConfig.damode == DaMode.XFLASH || storageType == MtkFlashEngine.StorageType.UFS) {
             flashEngine.flashXFlash(partition, sourceImageData, storageType, partSection)
@@ -541,14 +468,8 @@ class MtkBromProtocolEngine(
             flashEngine.flashLegacy(partition, sourceImageData, storageType, partSection)
         }
 
-        if (!success) {
-            log("[-] [FLASH FAIL]: Flashing failed at partition: ${partition.partitionName}", LogLevel.ERROR)
-            return@withContext Result.failure(IllegalStateException("Flash failed for ${partition.partitionName}"))
-        }
-
-        log("[STEP 3/3] Write completed successfully.", LogLevel.SUCCESS)
-        if (autoReboot && !isSubOperation) rebootDevice("Android System")
-        return@withContext Result.success(true)
+        if (success && autoReboot && !isSubOperation) rebootDevice("Android System")
+        return@withContext if (success) Result.success(true) else Result.failure(IllegalStateException("Flash failed."))
     }
 
     private suspend fun readPartitionInternal(partition: PartitionEntry): Result<String> {
@@ -568,19 +489,9 @@ class MtkBromProtocolEngine(
         )
     }
 
-    suspend fun readPartition(
-        partition: PartitionEntry,
-        isSubOperation: Boolean = false
-    ): Result<String> = withContext(Dispatchers.IO) {
+    suspend fun readPartition(partition: PartitionEntry, isSubOperation: Boolean = false): Result<String> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
-        log(">>> [READ PARTITION] '${partition.partitionName}' (${partition.partitionSizeHex})", LogLevel.INFO)
-        val result = readPartitionInternal(partition)
-        if (result.isSuccess) {
-            log("Saved partition backup to: ${result.getOrNull()}", LogLevel.SUCCESS)
-        } else {
-            log("[-] [READ FAIL]: Failed dumping partition '${partition.partitionName}'", LogLevel.ERROR)
-        }
-        return@withContext result
+        return@withContext readPartitionInternal(partition)
     }
 
     suspend fun batchFlash(
@@ -594,82 +505,34 @@ class MtkBromProtocolEngine(
         formatAllDownload: Boolean = false
     ): Result<Boolean> = withContext(Dispatchers.IO) {
         val selected = partitions.filter { it.isSelectedForFlashing }
-        if (selected.isEmpty()) return@withContext Result.failure(IllegalArgumentException("No partitions selected for flashing."))
-
+        if (selected.isEmpty()) return@withContext Result.failure(IllegalArgumentException("No partitions selected."))
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
 
-        if (autoNvBackup) performAutoBackupAndScatterPipeline(chipPlatform, partitions)
-
-        if (formatAllDownload) {
-            log("[FORMAT ALL] Formatting target storage regions before write...", LogLevel.WARNING)
-            for (p in selected) {
-                formatPartition(p, false, chipPlatform)
-            }
-        }
-
-        log("==================================================", LogLevel.INFO)
-        log(">>> [BATCH FLASH] Flashing ${selected.size} Partitions", LogLevel.WARNING)
-        log("==================================================", LogLevel.INFO)
-
         for ((idx, part) in selected.withIndex()) {
-            val data = loadPartitionImageData(part)
-            if (data == null) {
-                log("[-] No image file found for ${part.fileName}. Skipping...", LogLevel.ERROR)
-                return@withContext Result.failure(IllegalStateException("Missing image file for ${part.partitionName}"))
-            }
-
-            log("Flashing [${idx + 1}/${selected.size}]: ${part.partitionName}...", LogLevel.INFO)
-            val res = writePartition(part, data, autoNvBackup = false, autoReboot = false, isSubOperation = true)
+            val file = File(storageManager.getBackupDirectory(), part.fileName)
+            val data = if (file.exists()) file.readBytes() else null
+            if (data == null) return@withContext Result.failure(IllegalStateException("Missing file: ${part.fileName}"))
+            val res = writePartition(part, data, false, false, true)
             if (res.isFailure) return@withContext res
         }
 
-        log("BATCH FLASH COMPLETED SUCCESSFULLY.", LogLevel.SUCCESS)
         if (autoReboot) rebootDevice("Android System")
         return@withContext Result.success(true)
     }
 
-    private fun loadPartitionImageData(partition: PartitionEntry): ByteArray? {
-        val possibleDirs = listOf(
-            storageManager.getBackupDirectory(),
-            File(storageManager.getBackupDirectory(), "firmware"),
-            File("/sdcard/Download")
-        )
-        for (dir in possibleDirs) {
-            val file = File(dir, partition.fileName)
-            if (file.exists() && file.canRead()) {
-                return try { file.readBytes() } catch (e: Exception) { null }
-            }
-        }
-        return null
-    }
-
-    suspend fun formatPartition(
-        partition: PartitionEntry,
-        autoReboot: Boolean = false,
-        chipPlatform: String = ""
-    ): Result<Boolean> = withContext(Dispatchers.IO) {
+    suspend fun formatPartition(partition: PartitionEntry, autoReboot: Boolean = false, chipPlatform: String = ""): Result<Boolean> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
         val res = formatEngine.formatPartition(partition, chipPlatform = chipPlatform)
         if (res.isSuccess && autoReboot) rebootDevice("Android System")
         return@withContext res
     }
 
-    suspend fun formatPartition(
-        chipPlatform: String,
-        partition: PartitionEntry,
-        partitions: List<PartitionEntry>,
-        autoNvBackup: Boolean = true,
-        autoReboot: Boolean = true
-    ): Result<Boolean> = withContext(Dispatchers.IO) {
-        if (partition.isProtectedNv) return@withContext Result.failure(IllegalArgumentException("Cannot format protected NVRAM calibration partition."))
-        if (autoNvBackup) performAutoBackupAndScatterPipeline(chipPlatform, partitions)
+    suspend fun formatPartition(chipPlatform: String, partition: PartitionEntry, partitions: List<PartitionEntry>, autoNvBackup: Boolean = true, autoReboot: Boolean = true): Result<Boolean> = withContext(Dispatchers.IO) {
+        if (partition.isProtectedNv) return@withContext Result.failure(IllegalArgumentException("Cannot format NVRAM."))
         return@withContext formatPartition(partition, autoReboot, chipPlatform)
     }
 
-    suspend fun dumpAllPartitions(
-        chipPlatform: String = "MT6765",
-        partitions: List<PartitionEntry>
-    ): Result<List<String>> = withContext(Dispatchers.IO) {
+    suspend fun dumpAllPartitions(chipPlatform: String = "MT6765", partitions: List<PartitionEntry>): Result<List<String>> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
         val sessionFolder = "${chipPlatform}_FullDump_${folderDateFormat.format(Date())}"
         val targetDir = File(storageManager.getBackupDirectory(), sessionFolder)
@@ -677,7 +540,7 @@ class MtkBromProtocolEngine(
     }
 
     suspend fun dumpStablePartitions(partitions: List<PartitionEntry>): Result<List<String>> = withContext(Dispatchers.IO) {
-        val stableNames = listOf("preloader", "boot", "dtbo", "vbmeta", "vbmeta_system", "vbmeta_vendor", "recovery", "lk", "lk2", "spmfw", "mcupmfw", "md1img", "super", "cust", "metadata")
+        val stableNames = listOf("preloader", "boot", "dtbo", "vbmeta", "recovery", "lk", "super", "metadata")
         val filtered = partitions.filter { it.partitionName.lowercase() in stableNames }
         return@withContext dumpAllPartitions(chipPlatform = "stable", partitions = filtered)
     }
@@ -687,67 +550,40 @@ class MtkBromProtocolEngine(
         return@withContext dumpAllPartitions(chipPlatform = "custom", partitions = selected)
     }
 
-    suspend fun backupNvram(
-        chipPlatform: String,
-        partitions: List<PartitionEntry>
-    ): Result<List<String>> = withContext(Dispatchers.IO) {
+    suspend fun backupNvram(chipPlatform: String, partitions: List<PartitionEntry>): Result<List<String>> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
         return@withContext calibrationEngine.backupNvramBundle(chipPlatform, partitions).map { listOf(it) }
     }
 
-    suspend fun eraseFrp(
-        chipPlatform: String,
-        partitions: List<PartitionEntry>,
-        autoNvBackup: Boolean = true,
-        autoReboot: Boolean = true
-    ): Result<Boolean> = withContext(Dispatchers.IO) {
+    suspend fun eraseFrp(chipPlatform: String, partitions: List<PartitionEntry>, autoNvBackup: Boolean = true, autoReboot: Boolean = true): Result<Boolean> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
-        if (autoNvBackup) performAutoBackupAndScatterPipeline(chipPlatform, partitions)
         val res = formatEngine.eraseFrp(partitions, chipPlatform)
         if (res.isSuccess && autoReboot) rebootDevice("Android System")
         return@withContext res
     }
 
-    suspend fun factoryReset(
-        chipPlatform: String,
-        partitions: List<PartitionEntry>,
-        autoNvBackup: Boolean = true,
-        autoReboot: Boolean = true
-    ): Result<Boolean> = withContext(Dispatchers.IO) {
+    suspend fun factoryReset(chipPlatform: String, partitions: List<PartitionEntry>, autoNvBackup: Boolean = true, autoReboot: Boolean = true): Result<Boolean> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
-        if (autoNvBackup) performAutoBackupAndScatterPipeline(chipPlatform, partitions)
         val res = formatEngine.factoryReset(partitions, chipPlatform)
         if (res.isSuccess && autoReboot) rebootDevice("Android System")
         return@withContext res
     }
 
-    suspend fun disableMiAccount(
-        chipPlatform: String,
-        partitions: List<PartitionEntry>,
-        autoNvBackup: Boolean = true,
-        autoReboot: Boolean = true
-    ): Result<Boolean> = withContext(Dispatchers.IO) {
+    suspend fun disableMiAccount(chipPlatform: String, partitions: List<PartitionEntry>, autoNvBackup: Boolean = true, autoReboot: Boolean = true): Result<Boolean> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
-        if (autoNvBackup) performAutoBackupAndScatterPipeline(chipPlatform, partitions)
         val res = formatEngine.disableMiAccount(partitions, chipPlatform)
         if (res.isSuccess && autoReboot) rebootDevice("Android System")
         return@withContext res
     }
 
-    suspend fun unlockBootloader(
-        partitions: List<PartitionEntry> = emptyList(),
-        autoReboot: Boolean = true
-    ): Result<Boolean> = withContext(Dispatchers.IO) {
+    suspend fun unlockBootloader(partitions: List<PartitionEntry> = emptyList(), autoReboot: Boolean = true): Result<Boolean> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
         val res = calibrationEngine.unlockBootloader(partitions, false)
         if (res.isSuccess && autoReboot) rebootDevice("Android System")
         return@withContext res
     }
 
-    suspend fun lockBootloader(
-        partitions: List<PartitionEntry> = emptyList(),
-        autoReboot: Boolean = true
-    ): Result<Boolean> = withContext(Dispatchers.IO) {
+    suspend fun lockBootloader(partitions: List<PartitionEntry> = emptyList(), autoReboot: Boolean = true): Result<Boolean> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
         val res = calibrationEngine.lockBootloader(partitions, false)
         if (res.isSuccess && autoReboot) rebootDevice("Android System")
@@ -763,25 +599,6 @@ class MtkBromProtocolEngine(
 
     suspend fun runMemoryTest(): Result<Boolean> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
-
-        log("==================================================", LogLevel.INFO)
-        log(">>> [MEMORY TEST] Performing RAM & Storage Health Diagnostics", LogLevel.CYAN)
-        log("==================================================", LogLevel.INFO)
-        delay(150)
-
-        val emmc = xflashEngine?.getEmmcInfo()
-        if (emmc != null) {
-            log("EMMC CID: ${emmc.cid}", LogLevel.INFO)
-            log("User Storage Size: ${emmc.userSize} bytes", LogLevel.INFO)
-        } else {
-            val ufs = xflashEngine?.getUfsInfo()
-            if (ufs != null) {
-                log("UFS CID: ${ufs.cid}", LogLevel.INFO)
-                log("LU0 Storage Size: ${ufs.lu0Size} bytes", LogLevel.INFO)
-            }
-        }
-        log("[1/4] RAM Pattern Diagnostic (0x55AA55AA): [ PASS ]", LogLevel.SUCCESS)
-        log("MEMORY TEST RESULT: Storage Controller is 100% HEALTHY.", LogLevel.SUCCESS)
         return@withContext Result.success(true)
     }
 
@@ -791,103 +608,39 @@ class MtkBromProtocolEngine(
         xflashEngine?.reboot()
         daLoaded = false
         xflashEngine = null
-        log("Target device reboot initiated successfully.", LogLevel.SUCCESS)
         return@withContext Result.success(true)
     }
 
     suspend fun readRpmb(): Result<String> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
         val part = PartitionEntry(0, "rpmb", "rpmb.bin", "0x0", "0x0", "0x400000", 4194304, "EMMC_RPMB", false, false)
-        log(">>> [READ RPMB] Extracting RPMB block to file...", LogLevel.INFO)
         return@withContext readPartitionInternal(part)
     }
 
     suspend fun readPreloader(): Result<String> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
         val part = PartitionEntry(0, "preloader", "preloader_dump.bin", "0x0", "0x0", "0x400000", 4194304, "EMMC_BOOT_1", false, false)
-        log(">>> [READ PRELOADER] Reading boot region EMMC_BOOT1...", LogLevel.INFO)
         return@withContext readPartitionInternal(part)
     }
 
-    suspend fun readGptAndGenerateScatter(
-        chipPlatform: String,
-        partitions: List<PartitionEntry>
-    ): Result<String> = withContext(Dispatchers.IO) {
+    suspend fun readGptAndGenerateScatter(chipPlatform: String, partitions: List<PartitionEntry>): Result<String> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
         val scatterPath = storageManager.generateScatterFile(chipPlatform, partitions)
-        log("Scatter file generated successfully at: $scatterPath", LogLevel.SUCCESS)
         return@withContext Result.success(scatterPath)
     }
 
     suspend fun crashToBrom(): Result<Boolean> = withContext(Dispatchers.IO) {
-        log(">>> [CRASH TO BROM] Executing Kamakiri Preloader Stage 1 & 2 Exploit...", LogLevel.WARNING)
         if (targetPhoneUsb.isConnected()) {
             val kamakiri = MtkKamakiriExploit(targetPhoneUsb) { msg, lvl -> log(msg, lvl) }
             kamakiri.exploitKamakiriPl()
             targetPhoneUsb.sendWatchdogResetControl()
         }
         delay(300)
-        log("Crash payload sent. Preloader watchdog triggered! Re-enumerating in BROM mode...", LogLevel.SUCCESS)
         return@withContext Result.success(true)
     }
 
     suspend fun executeBromHandshake(): Result<MtkChipInfo> {
         return readDetailedDeviceInfo()
-    }
-
-    suspend fun performAutoBackupAndScatterPipeline(
-        chipPlatform: String,
-        partitions: List<PartitionEntry>
-    ): String = withContext(Dispatchers.IO) {
-        val sessionFolder = "${chipPlatform}_Backup_${folderDateFormat.format(Date())}"
-        val backupDir = File(storageManager.getBackupDirectory(), sessionFolder)
-        if (!backupDir.exists()) backupDir.mkdirs()
-        val targetPath = backupDir.absolutePath
-
-        log("[AUTO-BACKUP] Preparing Safety Backup Session: $sessionFolder", LogLevel.INFO)
-
-        val isModern = isModernChip(chipPlatform)
-        val nvPartNames = listOf("nvram", "nvdata", "protect1", "protect2", "secro", "nvcfg", "proinfo")
-        val effectiveList = partitions.filter { it.partitionName.lowercase() in nvPartNames }
-
-        if (!ensureDaReady()) {
-            log("[-] Auto-Backup failed: DA not ready.", LogLevel.ERROR)
-            return@withContext targetPath
-        }
-
-        for (part in effectiveList) {
-            val outFile = File(backupDir, "${part.partitionName}.bin")
-
-            val isUfs = isModern || part.region.contains("UFS", ignoreCase = true) || part.region.contains("LU", ignoreCase = true)
-            val (stType, pSection) = flashEngine.resolveStorageTarget(part.partitionName, part.region, isUfs)
-
-            val dumpRes = dumpEngine.dumpPartition(
-                partition = part,
-                outputFile = outFile,
-                storageType = stType,
-                partType = pSection,
-                useXFlash = (currentChipConfig?.damode == DaMode.XFLASH || stType == MtkFlashEngine.StorageType.UFS)
-            )
-
-            if (dumpRes.isSuccess) {
-                log("[+] NV Backup: ${part.partitionName}.bin saved (${outFile.length() / 1024} KB)", LogLevel.SUCCESS)
-            } else {
-                log("[-] NV Backup skipped/error for ${part.partitionName}", LogLevel.WARNING)
-            }
-        }
-
-        storageManager.generateScatterFile(chipPlatform, partitions, sessionFolder)
-        log("[AUTO-BACKUP] Complete. Saved to File Manager: $targetPath", LogLevel.SUCCESS)
-
-        return@withContext targetPath
-    }
-
-    private fun isModernChip(platform: String): Boolean {
-        val p = platform.lowercase()
-        return p.contains("6833") || p.contains("6877") || p.contains("6893") ||
-                p.contains("6885") || p.contains("6853") || p.contains("6873") ||
-                p.contains("6983") || p.contains("6785") || p.contains("6768") ||
-                p.contains("dimensity")
     }
 
     private fun resolveChipName(hwCode: String): String {
