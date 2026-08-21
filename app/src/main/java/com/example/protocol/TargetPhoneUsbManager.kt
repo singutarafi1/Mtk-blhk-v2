@@ -1,6 +1,5 @@
 package com.example.protocol
 
-import java.util.concurrent.atomic.AtomicBoolean
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -21,6 +20,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class UsbDeviceMode(val label: String, val description: String) {
     BROM("MTK BROM", "MediaTek BootROM Mode (Flash & Service Ready)"),
@@ -50,34 +52,48 @@ sealed class TargetPhoneState {
     data class Error(val message: String) : TargetPhoneState()
 }
 
+/**
+ * MediaTek Hardware USB Host Controller
+ * Faithfully ported from Python mtkclient: port.py, mtk.py, brom.py
+ * 100% Native Implementation for Android USB OTG.
+ */
 class TargetPhoneUsbManager(
     private val context: Context
 ) {
     companion object {
         const val ACTION_USB_PHONE_PERMISSION = "com.example.mtkbridge.USB_PHONE_PERMISSION"
+        
+        // MediaTek USB Identifiers
         const val MTK_VID = 0x0E8D
         const val MTK_PID_BROM = 0x0003
+        const val MTK_PID_BOOTROM_GENERIC = 0x0001
+        const val MTK_PID_DA_HIGH_SPEED = 0x0002
+        const val MTK_PID_PRELOADER_ALT = 0x0005
         const val MTK_PID_PRELOADER = 0x2000
         const val MTK_PID_PRELOADER_2 = 0x2001
         const val MTK_PID_CDC = 0x2004
         const val MTK_PID_DEBUG = 0x2005
-        const val MTK_PID_BOOTROM_GENERIC = 0x0001
-        const val MTK_PID_DA_HIGH_SPEED = 0x0002
-        const val MTK_PID_PRELOADER_ALT = 0x0005
 
         val SUPPORTED_VIDS = setOf(
             0x0E8D, 0x1004, 0x0BB4, 0x2A45, 0x1782,
             0x1A86, 0x10C4, 0x0403, 0x18D1, 0x2717
         )
+
+        // MTK BROM Handshake Magic Sequence
+        val HANDSHAKE_SEND = byteArrayOf(0xA0.toByte(), 0x0A.toByte(), 0x50.toByte(), 0x05.toByte())
+        val HANDSHAKE_ECHO = byteArrayOf(0x5F.toByte(), 0xF5.toByte(), 0xAF.toByte(), 0xFA.toByte())
     }
 
-    val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+    val usbManager: UsbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+    
     private var usbConnection: UsbDeviceConnection? = null
     private var usbInterface: UsbInterface? = null
     private var inEndpoint: UsbEndpoint? = null
     private var outEndpoint: UsbEndpoint? = null
+    
     var currentDevice: UsbDevice? = null
         private set
+        
     private val scope = CoroutineScope(Dispatchers.IO)
 
     var onDeviceAutoConnectedListener: ((TargetPhoneState.Connected) -> Unit)? = null
@@ -111,7 +127,7 @@ class TargetPhoneUsbManager(
                         if (strictBromOnlyMode && !isBromDevice(device)) return
                         scope.launch { connectDevice(device) }
                     } else {
-                        _phoneState.value = TargetPhoneState.Error("USB Permission was not granted.")
+                        _phoneState.value = TargetPhoneState.Error("USB Permission denied by user.")
                     }
                 }
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
@@ -161,6 +177,7 @@ class TargetPhoneUsbManager(
         if (isBromDevice(device)) return UsbDeviceMode.BROM
         val vid = device.vendorId
         val pid = device.productId
+        
         if (vid == MTK_VID && (pid == MTK_PID_PRELOADER || pid == MTK_PID_PRELOADER_2 || pid == MTK_PID_CDC || pid == MTK_PID_DEBUG)) {
             return UsbDeviceMode.PRELOADER
         }
@@ -260,7 +277,7 @@ class TargetPhoneUsbManager(
     suspend fun connectDevice(targetDevice: UsbDevice): Boolean = withContext(Dispatchers.IO) {
         try {
             val connection = usbManager.openDevice(targetDevice) ?: run {
-                _phoneState.value = TargetPhoneState.Error("Failed to open target USB port")
+                _phoneState.value = TargetPhoneState.Error("Failed to open target USB port via UsbManager.")
                 return@withContext false
             }
 
@@ -283,22 +300,6 @@ class TargetPhoneUsbManager(
                     bulkIn = tempIn
                     bulkOut = tempOut
                     break
-                }
-            }
-
-            if (claimedIface == null) {
-                for (i in 0 until targetDevice.interfaceCount) {
-                    val iface = targetDevice.getInterface(i)
-                    for (j in 0 until iface.endpointCount) {
-                        val ep = iface.getEndpoint(j)
-                        if (ep.direction == UsbConstants.USB_DIR_IN && bulkIn == null) {
-                            bulkIn = ep
-                            if (claimedIface == null) claimedIface = iface
-                        } else if (ep.direction == UsbConstants.USB_DIR_OUT && bulkOut == null) {
-                            bulkOut = ep
-                            if (claimedIface == null) claimedIface = iface
-                        }
-                    }
                 }
             }
 
@@ -339,12 +340,15 @@ class TargetPhoneUsbManager(
             onDeviceAutoConnectedListener?.invoke(state)
             return@withContext true
         } catch (e: Exception) {
-            _phoneState.value = TargetPhoneState.Error("Target USB Error: ${e.message}")
+            _phoneState.value = TargetPhoneState.Error("Target USB Connection Error: ${e.message}")
             return@withContext false
         }
     }
 
-    fun flush(timeoutMs: Int = 10): Int {
+    /**
+     * Flushes dangling bytes from USB IN endpoint buffer.
+     */
+    fun flush(timeoutMs: Int = 15): Int {
         val conn = usbConnection ?: return 0
         val ep = inEndpoint ?: return 0
         val tempBuf = ByteArray(1024)
@@ -357,15 +361,14 @@ class TargetPhoneUsbManager(
     }
 
     /**
-     * Executes MTK handshake sync sequence matching mtkclient python implementation.
-     * Suspended with IO dispatcher and cooperative delay.
+     * Executes MTK BROM Handshake Sync sequence matching Python mtkclient (0xA0 -> 0x5F, 0x0A -> 0xF5, 0x50 -> 0xAF, 0x05 -> 0xFA).
      */
     suspend fun blastBromHandshakeSync(maxAttempts: Int = 60): Boolean = withContext(Dispatchers.IO) {
         val conn = usbConnection ?: return@withContext false
         val outEp = outEndpoint ?: return@withContext false
         val inEp = inEndpoint ?: return@withContext false
 
-        flush(15)
+        flush(20)
 
         val rxBuf = ByteArray(1)
         val sendA0 = byteArrayOf(0xA0.toByte())
@@ -385,18 +388,50 @@ class TargetPhoneUsbManager(
 
         if (!syncedA0) return@withContext false
 
+        // Complete 0x0A -> 0xF5
         val send0A = byteArrayOf(0x0A.toByte())
         if (conn.bulkTransfer(outEp, send0A, 1, 150) != 1) return@withContext false
         if (conn.bulkTransfer(inEp, rxBuf, 1, 150) != 1 || rxBuf[0] != 0xF5.toByte()) return@withContext false
 
+        // Complete 0x50 -> 0xAF
         val send50 = byteArrayOf(0x50.toByte())
         if (conn.bulkTransfer(outEp, send50, 1, 150) != 1) return@withContext false
         if (conn.bulkTransfer(inEp, rxBuf, 1, 150) != 1 || rxBuf[0] != 0xAF.toByte()) return@withContext false
 
+        // Complete 0x05 -> 0xFA
         val send05 = byteArrayOf(0x05.toByte())
         if (conn.bulkTransfer(outEp, send05, 1, 150) != 1) return@withContext false
         if (conn.bulkTransfer(inEp, rxBuf, 1, 150) != 1 || rxBuf[0] != 0xFA.toByte()) return@withContext false
 
+        return@withContext true
+    }
+
+    /**
+     * Kills Hardware Watchdog Timer (WDT) to prevent target phone from rebooting during BROM/DA stage.
+     * CMD_WRITE32 (0xD4) -> WDT Reg (0x10007000) -> Value (0x22000000 WDT_KEY).
+     */
+    suspend fun disableWatchdog(wdtAddress: Long = 0x10007000L): Boolean = withContext(Dispatchers.IO) {
+        val conn = usbConnection ?: return@withContext false
+        val outEp = outEndpoint ?: return@withContext false
+        val inEp = inEndpoint ?: return@withContext false
+
+        // CMD_WRITE32 = 0xD4
+        val cmdBuf = ByteBuffer.allocate(9).order(ByteOrder.BIG_ENDIAN)
+        cmdBuf.put(0xD4.toByte())
+        cmdBuf.putInt((wdtAddress and 0xFFFFFFFFL).toInt())
+        cmdBuf.putInt(1) // 1 Dword
+
+        if (conn.bulkTransfer(outEp, cmdBuf.array(), 9, 1000) <= 0) return@withContext false
+
+        val ack = ByteArray(2)
+        conn.bulkTransfer(inEp, ack, 2, 1000)
+
+        // MTK WDT Unlock/Disable Key
+        val valBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(0x22000000).array()
+        if (conn.bulkTransfer(outEp, valBuf, 4, 1000) <= 0) return@withContext false
+
+        val postAck = ByteArray(2)
+        conn.bulkTransfer(inEp, postAck, 2, 1000)
         return@withContext true
     }
 
