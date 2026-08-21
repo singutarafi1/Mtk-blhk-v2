@@ -203,7 +203,7 @@ class MtkBromProtocolEngine(
             ?: MtkChipConfigDatabase.findConfig(0x0766)!!
         currentChipConfig = chipConfig
 
-        // 4. Execute Auth / SLA / Security Bypass before uploading DA
+        // 4. Execute Auth / SLA / Security Bypass
         log("[DA READY] Executing Security SLA/DAA Bypass for ${chipConfig.name}...", LogLevel.INFO)
         val bypassRes = securityEngine.executeBypass(
             MtkChipInfo(
@@ -221,19 +221,17 @@ class MtkBromProtocolEngine(
             log("[-] Security Bypass Warning: ${bypassRes.exceptionOrNull()?.message}", LogLevel.WARNING)
         }
 
-        // 5. Load DA payload from assets (Priority: MTK_DA_V5 > MTK_AllInOne > Payload)
-        var daBytes = MtkAssetManager.loadDaBytes(context, "MTK_DA_V5.bin")
+        // 5. Load DA payload from assets
+        var daBytes = MtkAssetManager.resolveDaForChip(context, chipConfig)
+            ?: MtkAssetManager.loadDaBytes(context, "MTK_DA_V5.bin")
             ?: MtkAssetManager.loadDaBytes(context, "MTK_AllInOne_DA.bin")
-        if (daBytes == null || daBytes.size < 32) {
-            daBytes = MtkAssetManager.resolveDaForChip(context, chipConfig)
-        }
 
         if (daBytes == null || daBytes.size < 32) {
-            log("[-] No valid DA/payload found for ${chipConfig.name}", LogLevel.ERROR)
+            log("[-] No valid DA found for ${chipConfig.name}", LogLevel.ERROR)
             return false
         }
 
-        // 6. Parse DA
+        // 6. Parse DA container
         val daInfo = MtkDaParser.parseDaLoader(daBytes, hwCode, defaultLoadAddr = chipConfig.daPayloadAddr)
         if (daInfo == null) {
             log("[-] Failed to parse DA binary.", LogLevel.ERROR)
@@ -246,7 +244,9 @@ class MtkBromProtocolEngine(
             return false
         }
 
-        val daAddress1 = daInfo.stage1?.startAddress ?: chipConfig.daPayloadAddr
+        // Ensure Stage 1 loads into SRAM, not DRAM
+        val rawStartAddr = daInfo.stage1?.startAddress ?: chipConfig.daPayloadAddr
+        val daAddress1 = if (rawStartAddr >= 0x80000000L) chipConfig.daPayloadAddr else rawStartAddr
 
         // 7. Upload DA Stage 1
         val uploadResult = MtkDaUploader.sendDa(
@@ -298,14 +298,14 @@ class MtkBromProtocolEngine(
         // 10. Extract DA Stage 2
         val stage2Bytes = daInfo.getStage2Bytes()
         if (stage2Bytes == null || stage2Bytes.isEmpty()) {
-            log("[-] No DA Stage 2 region found in container. Raw Stage 1 only mode is not supported for XFlash.", LogLevel.ERROR)
+            log("[-] No DA Stage 2 region found in container.", LogLevel.ERROR)
             return false
         }
 
         // 11. Initialize XFlash Engine and Handshake
         val xf = MtkXFlashEngine(targetPhoneUsb) { log(it.message, it.level) }
         if (!xf.connect()) {
-            log("[-] XFlash Connect Handshake failed. DA Stage 1 may not be responding.", LogLevel.ERROR)
+            log("[-] XFlash Connect Handshake failed.", LogLevel.ERROR)
             return false
         }
 
@@ -508,14 +508,13 @@ class MtkBromProtocolEngine(
         val isModern = chipConfig.damode == DaMode.XFLASH || partition.region.contains("UFS", true)
         val (storageType, partSection) = flashEngine.resolveStorageTarget(partition.partitionName, partition.region, isModern)
 
-        val result = dumpEngine.dumpPartition(
+        return dumpEngine.dumpPartition(
             partition = partition,
             outputFile = outFile,
             storageType = storageType,
             partType = partSection,
             useXFlash = (chipConfig.damode == DaMode.XFLASH || storageType == MtkFlashEngine.StorageType.UFS)
         )
-        return result
     }
 
     suspend fun readPartition(
