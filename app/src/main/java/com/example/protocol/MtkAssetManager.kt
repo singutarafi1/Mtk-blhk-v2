@@ -28,7 +28,7 @@ object MtkAssetManager {
 
     /**
      * Resolves the real MediaTek Download Agent (DA) Container for a given SoC configuration.
-     * NEVER falls back to small exploit payloads (< 4KB).
+     * Rejects small exploit payloads (< 4KB) and verifies valid DA parsing.
      */
     fun resolveDaForChip(context: Context, config: ChipConfig?): ByteArray? {
         if (config == null) return null
@@ -36,7 +36,7 @@ object MtkAssetManager {
         val hwCodeHex = "0x%04X".format(config.hwCode)
         val socName = config.name.replace("/", "_").lowercase()
 
-        // 1. Priority: Universal Containers in assets/da/
+        // 1. Priority: Universal Containers in assets/da/ or External Storage
         val universalCandidates = listOf(
             "MTK_DA_V5.bin",
             "MTK_DA_V6.bin",
@@ -46,13 +46,10 @@ object MtkAssetManager {
         for (candidate in universalCandidates) {
             val daBytes = loadDaBytes(context, candidate)
             if (daBytes != null && daBytes.size >= MIN_DA_CONTAINER_SIZE) {
-                val daList = MtkDaParser.parseAllDa(daBytes)
-                if (daList.isNotEmpty()) {
-                    val match = MtkDaParser.findDa(daList, config.hwCode)
-                    if (match != null) {
-                        Log.d(TAG, "[DA RESOLVE] Found matching DA for $hwCodeHex in $candidate")
-                        return daBytes
-                    }
+                val daInfo = MtkDaParser.parseDaLoader(daBytes, config.hwCode, config.daPayloadAddr)
+                if (daInfo != null && daInfo.stage1 != null && daInfo.stage1.length >= MIN_DA_CONTAINER_SIZE) {
+                    Log.d(TAG, "[DA RESOLVE] Valid DA Container matched for $hwCodeHex in $candidate")
+                    return daBytes
                 }
             }
         }
@@ -67,16 +64,16 @@ object MtkAssetManager {
         for (candidate in dedicatedCandidates) {
             val daBytes = loadDaBytes(context, candidate)
             if (daBytes != null && daBytes.size >= MIN_DA_CONTAINER_SIZE) {
-                Log.d(TAG, "[DA RESOLVE] Found dedicated DA: $candidate")
+                Log.d(TAG, "[DA RESOLVE] Found dedicated DA binary: $candidate")
                 return daBytes
             }
         }
 
-        // 3. Fallback: First valid universal container
+        // 3. Fallback: First available valid universal container
         for (candidate in universalCandidates) {
             val daBytes = loadDaBytes(context, candidate)
             if (daBytes != null && daBytes.size >= MIN_DA_CONTAINER_SIZE) {
-                Log.w(TAG, "[DA RESOLVE] Using generic fallback container: $candidate")
+                Log.w(TAG, "[DA RESOLVE] Dedicated match not found. Using generic fallback: $candidate")
                 return daBytes
             }
         }
@@ -107,7 +104,7 @@ object MtkAssetManager {
             if (extFile.exists() && extFile.canRead()) {
                 return try {
                     extFile.readBytes()
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     null
                 }
             }
