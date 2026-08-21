@@ -1,201 +1,455 @@
 package com.example.protocol
 
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
-import android.util.Log
-import com.example.model.MtkDeviceModel
-import java.io.File
-import java.io.InputStream
+import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.usb.UsbConstants
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbDeviceConnection
+import android.hardware.usb.UsbEndpoint
+import android.hardware.usb.UsbInterface
+import android.hardware.usb.UsbManager
+import android.os.Build
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicBoolean
+
+enum class UsbDeviceMode(val label: String, val description: String) {
+    BROM("MTK BROM", "MediaTek BootROM Mode (Flash & Service Ready)"),
+    PRELOADER("Preloader", "MTK Preloader / DA VCOM Port"),
+    FASTBOOT("Fastboot", "Android Fastboot Bootloader Mode"),
+    ADB("ADB Debugging", "Android USB Debugging Interface"),
+    MTP("MTP / File Transfer", "Media Transfer Protocol (Normal Android Boot)"),
+    CDC_SERIAL("CDC Serial", "Serial / UART Bridge Device"),
+    UNKNOWN("USB Device", "Connected USB Peripheral"),
+    NONE("Unplugged", "No USB Device Connected")
+}
+
+sealed class TargetPhoneState {
+    object Disconnected : TargetPhoneState()
+    data class RequestingPermission(
+        val deviceName: String,
+        val mode: UsbDeviceMode,
+        val vidPid: String
+    ) : TargetPhoneState()
+    data class Connected(
+        val deviceName: String,
+        val mode: UsbDeviceMode,
+        val isBromMode: Boolean,
+        val vidPid: String,
+        val fileDescriptor: Int = -1
+    ) : TargetPhoneState()
+    data class Error(val message: String) : TargetPhoneState()
+}
 
 /**
- * MediaTek Native Binary Asset Resolver
- * Faithfully mirrors Python mtkclient (daconfig.py, mtk.py)
- * STRICT: Rejects exploit payloads when DA container is required.
+ * Native Android USB Host Driver for MediaTek Protocol
+ * Faithful port of Python mtkclient port.py & mtk.py
+ * Contains Race-Condition Mutex Lock & Watchdog Killer
  */
-object MtkAssetManager {
+class TargetPhoneUsbManager(
+    private val context: Context
+) {
+    companion object {
+        const val ACTION_USB_PHONE_PERMISSION = "com.example.mtkbridge.USB_PHONE_PERMISSION"
+        
+        const val MTK_VID = 0x0E8D
+        const val MTK_PID_BROM = 0x0003
+        const val MTK_PID_BOOTROM_GENERIC = 0x0001
+        const val MTK_PID_DA_HIGH_SPEED = 0x0002
+        const val MTK_PID_PRELOADER_ALT = 0x0005
+        const val MTK_PID_PRELOADER = 0x2000
+        const val MTK_PID_PRELOADER_2 = 0x2001
+        const val MTK_PID_CDC = 0x2004
+        const val MTK_PID_DEBUG = 0x2005
 
-    private const val TAG = "MtkAssetManager"
-    private const val EXTERNAL_BASE_PATH = "/sdcard/NativeUnlockTool"
-    private const val EXTERNAL_DOWNLOAD_PATH = "/sdcard/Download/MTK_Loaders"
-    private const val MIN_DA_CONTAINER_SIZE = 4096 // 4KB minimum threshold
-
-    fun getStage1Target(chipCode: String): MtkStage1Target? {
-        return MtkStage1TargetCatalog.findTarget(chipCode)
-    }
-
-    fun getStage1TargetForModel(model: MtkDeviceModel): MtkStage1Target? {
-        return MtkStage1TargetCatalog.findTarget(model.chipCode)
-    }
-
-    /**
-     * Resolves the real MediaTek Download Agent (DA) Container for a given SoC configuration.
-     * NEVER falls back to small exploit payloads (< 4KB).
-     */
-    fun resolveDaForChip(context: Context, config: ChipConfig?): ByteArray? {
-        if (config == null) return null
-
-        val hwCodeHex = "0x%04X".format(config.hwCode)
-        val socName = config.name.replace("/", "_").lowercase()
-
-        // 1. Priority: Universal Containers in assets/da/
-        val universalCandidates = listOf(
-            "MTK_DA_V5.bin",
-            "MTK_DA_V6.bin",
-            "MTK_AllInOne_DA.bin"
+        val SUPPORTED_VIDS = setOf(
+            0x0E8D, 0x1004, 0x0BB4, 0x2A45, 0x1782,
+            0x1A86, 0x10C4, 0x0403, 0x18D1, 0x2717
         )
+    }
 
-        for (candidate in universalCandidates) {
-            val daBytes = loadDaBytes(context, candidate)
-            if (daBytes != null && daBytes.size >= MIN_DA_CONTAINER_SIZE) {
-                val daList = MtkDaParser.parseAllDa(daBytes)
-                if (daList.isNotEmpty()) {
-                    val match = MtkDaParser.findDa(daList, config.hwCode)
-                    if (match != null) {
-                        Log.d(TAG, "[DA RESOLVE] Found matching DA for $hwCodeHex in $candidate")
-                        return daBytes
+    val usbManager: UsbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+    
+    private var usbConnection: UsbDeviceConnection? = null
+    private var usbInterface: UsbInterface? = null
+    private var inEndpoint: UsbEndpoint? = null
+    private var outEndpoint: UsbEndpoint? = null
+    
+    var currentDevice: UsbDevice? = null
+        private set
+        
+    private val scope = CoroutineScope(Dispatchers.IO)
+
+    var onDeviceAutoConnectedListener: ((TargetPhoneState.Connected) -> Unit)? = null
+
+    @Volatile
+    var strictBromOnlyMode: Boolean = false
+
+    private val _phoneState = MutableStateFlow<TargetPhoneState>(TargetPhoneState.Disconnected)
+    val phoneState: StateFlow<TargetPhoneState> = _phoneState.asStateFlow()
+
+    // Concurrency / Race-condition Guards
+    private val isPermissionRequested = AtomicBoolean(false)
+    private val isConnecting = AtomicBoolean(false)
+    private var lastPermissionRequestTimestamp = 0L
+    private var requestedDeviceKey: String? = null
+
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            val action = intent?.action ?: return
+            when (action) {
+                ACTION_USB_PHONE_PERMISSION -> {
+                    isPermissionRequested.set(false)
+                    requestedDeviceKey = null
+
+                    val device: UsbDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    }
+                    val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    if (granted && device != null) {
+                        if (strictBromOnlyMode && !isBromDevice(device)) return
+                        scope.launch { connectDevice(device) }
+                    } else {
+                        _phoneState.value = TargetPhoneState.Error("USB Permission denied by user.")
                     }
                 }
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                    val device: UsbDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    }
+                    if (device != null) {
+                        if (strictBromOnlyMode && !isBromDevice(device)) return
+                        scope.launch {
+                            if (usbManager.hasPermission(device)) connectDevice(device)
+                            else requestDevicePermission(device)
+                        }
+                    }
+                }
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    isPermissionRequested.set(false)
+                    requestedDeviceKey = null
+                    disconnect()
+                }
             }
         }
-
-        // 2. Priority: Dedicated SoC DA Binaries
-        val dedicatedCandidates = listOf(
-            "da_$socName.bin",
-            "da_${socName}_xflash.bin",
-            "da_${hwCodeHex.lowercase()}.bin"
-        )
-
-        for (candidate in dedicatedCandidates) {
-            val daBytes = loadDaBytes(context, candidate)
-            if (daBytes != null && daBytes.size >= MIN_DA_CONTAINER_SIZE) {
-                Log.d(TAG, "[DA RESOLVE] Found dedicated DA: $candidate")
-                return daBytes
-            }
-        }
-
-        // 3. Fallback: First valid universal container
-        for (candidate in universalCandidates) {
-            val daBytes = loadDaBytes(context, candidate)
-            if (daBytes != null && daBytes.size >= MIN_DA_CONTAINER_SIZE) {
-                Log.w(TAG, "[DA RESOLVE] Using generic fallback container: $candidate")
-                return daBytes
-            }
-        }
-
-        Log.e(TAG, "[DA RESOLVE ERROR] No valid DA container found for ${config.name}")
-        return null
     }
 
-    /**
-     * Loads BROM Exploit Payload (mt6765_payload.bin ~ 624 bytes) for SRAM injection only.
-     */
-    fun loadPayloadBytes(context: Context, fileNameOrSoc: String): ByteArray? {
-        val target = MtkStage1TargetCatalog.findTarget(fileNameOrSoc)
-        val fileName = if (fileNameOrSoc.endsWith(".bin")) {
-            fileNameOrSoc
+    init {
+        val filter = IntentFilter().apply {
+            addAction(ACTION_USB_PHONE_PERMISSION)
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
-            target?.payloadFileName ?: "${fileNameOrSoc.lowercase()}_payload.bin"
+            context.registerReceiver(usbReceiver, filter)
+        }
+    }
+
+    fun isBromDevice(device: UsbDevice): Boolean {
+        return device.vendorId == MTK_VID && device.productId in listOf(
+            MTK_PID_BROM, MTK_PID_BOOTROM_GENERIC, MTK_PID_DA_HIGH_SPEED, MTK_PID_PRELOADER_ALT
+        )
+    }
+
+    fun detectDeviceMode(device: UsbDevice): UsbDeviceMode {
+        if (isBromDevice(device)) return UsbDeviceMode.BROM
+        val vid = device.vendorId
+        val pid = device.productId
+        
+        if (vid == MTK_VID && (pid == MTK_PID_PRELOADER || pid == MTK_PID_PRELOADER_2 || pid == MTK_PID_CDC || pid == MTK_PID_DEBUG)) {
+            return UsbDeviceMode.PRELOADER
         }
 
-        // 1. External Storage
-        val extCandidates = listOf(
-            File("$EXTERNAL_BASE_PATH/payloads/$fileName"),
-            File("$EXTERNAL_DOWNLOAD_PATH/payloads/$fileName"),
-            File("$EXTERNAL_BASE_PATH/$fileName")
-        )
+        var hasFastboot = false
+        var hasAdb = false
+        var hasMtp = false
+        var hasCdc = false
 
-        for (extFile in extCandidates) {
-            if (extFile.exists() && extFile.canRead()) {
-                return try {
-                    extFile.readBytes()
-                } catch (e: Exception) {
-                    null
-                }
+        for (i in 0 until device.interfaceCount) {
+            val iface = device.getInterface(i)
+            if (iface.interfaceClass == UsbConstants.USB_CLASS_VENDOR_SPEC && iface.interfaceSubclass == 0x42) {
+                if (iface.interfaceProtocol == 0x03) hasFastboot = true
+                if (iface.interfaceProtocol == 0x01) hasAdb = true
             }
+            if (iface.interfaceClass == UsbConstants.USB_CLASS_STILL_IMAGE) hasMtp = true
+            if (iface.interfaceClass == UsbConstants.USB_CLASS_CDC_DATA || iface.interfaceClass == UsbConstants.USB_CLASS_COMM) hasCdc = true
         }
 
-        // 2. Assets (assets/payloads/<file>)
-        val assetPaths = listOf(
-            "payloads/$fileName",
-            fileName
+        if (hasFastboot) return UsbDeviceMode.FASTBOOT
+        if (hasAdb) return UsbDeviceMode.ADB
+        if (vid == MTK_VID) return UsbDeviceMode.PRELOADER
+        if (hasCdc || vid == 0x1A86 || vid == 0x10C4 || vid == 0x0403) return UsbDeviceMode.CDC_SERIAL
+        if (hasMtp) return UsbDeviceMode.MTP
+        return UsbDeviceMode.UNKNOWN
+    }
+
+    fun isMediaTekDevice(device: UsbDevice): Boolean = device.vendorId in SUPPORTED_VIDS
+
+    fun getAttachedDevices(): List<UsbDevice> = usbManager.deviceList.values.toList()
+
+    fun isBromConnected(): Boolean = currentDevice?.let { isBromDevice(it) } ?: false
+
+    fun requestDevicePermission(device: UsbDevice) {
+        val deviceKey = "${device.vendorId}:${device.productId}:${device.deviceName}"
+        val now = System.currentTimeMillis()
+        if (isPermissionRequested.get() && (now - lastPermissionRequestTimestamp < 8000L) && requestedDeviceKey == deviceKey) return
+
+        isPermissionRequested.set(true)
+        lastPermissionRequestTimestamp = now
+        requestedDeviceKey = deviceKey
+
+        val mode = detectDeviceMode(device)
+        val vidPidStr = String.format("0x%04X:0x%04X", device.vendorId, device.productId)
+        _phoneState.value = TargetPhoneState.RequestingPermission(
+            deviceName = device.productName ?: "Target Phone",
+            mode = mode,
+            vidPid = vidPidStr
         )
 
-        for (path in assetPaths) {
-            try {
-                context.assets.open(path).use { stream: InputStream ->
-                    val bytes = stream.readBytes()
-                    if (bytes.isNotEmpty()) return bytes
-                }
-            } catch (_: Exception) {}
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val permissionIntent = PendingIntent.getBroadcast(
+            context, 0,
+            Intent(ACTION_USB_PHONE_PERMISSION).setPackage(context.packageName),
+            flags
+        )
+        usbManager.requestPermission(device, permissionIntent)
+    }
+
+    suspend fun scanAndConnect(forceBromOnly: Boolean = false): Boolean = withContext(Dispatchers.IO) {
+        val requireBrom = forceBromOnly || strictBromOnlyMode
+        val deviceList = usbManager.deviceList
+        if (deviceList.isEmpty()) {
+            if (!isPermissionRequested.get()) _phoneState.value = TargetPhoneState.Disconnected
+            return@withContext false
         }
 
-        return null
+        if (requireBrom) {
+            val bromDevice = deviceList.values.firstOrNull { isBromDevice(it) } ?: return@withContext false
+            if (!usbManager.hasPermission(bromDevice)) {
+                requestDevicePermission(bromDevice)
+                return@withContext false
+            }
+            return@withContext connectDevice(bromDevice)
+        }
+
+        val targetDevice = deviceList.values.firstOrNull { it.vendorId == MTK_VID }
+            ?: deviceList.values.firstOrNull { isMediaTekDevice(it) }
+            ?: deviceList.values.firstOrNull()
+            ?: return@withContext false
+
+        if (!usbManager.hasPermission(targetDevice)) {
+            requestDevicePermission(targetDevice)
+            return@withContext false
+        }
+        return@withContext connectDevice(targetDevice)
     }
 
     /**
-     * Loads Download Agent Binary bytes from External Storage or Assets.
+     * Connects to USB device with Re-entrancy Lock (Prevents double FD open race conditions).
      */
-    fun loadDaBytes(context: Context, daFileName: String): ByteArray? {
-        val cleanName = daFileName.trim()
+    suspend fun connectDevice(targetDevice: UsbDevice): Boolean = withContext(Dispatchers.IO) {
+        if (isConnecting.getAndSet(true)) {
+            return@withContext true
+        }
 
-        // 1. External Storage
-        val extCandidates = listOf(
-            File("$EXTERNAL_BASE_PATH/da/$cleanName"),
-            File("$EXTERNAL_BASE_PATH/loaders/$cleanName"),
-            File("$EXTERNAL_DOWNLOAD_PATH/$cleanName"),
-            File("$EXTERNAL_BASE_PATH/$cleanName")
-        )
+        try {
+            // Check if already actively claimed and connected
+            if (usbConnection != null && currentDevice?.deviceId == targetDevice.deviceId) {
+                return@withContext true
+            }
 
-        for (extFile in extCandidates) {
-            if (extFile.exists() && extFile.canRead()) {
-                try {
-                    val bytes = extFile.readBytes()
-                    if (bytes.size >= MIN_DA_CONTAINER_SIZE) return bytes
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error reading external DA: ${e.message}")
+            val connection = usbManager.openDevice(targetDevice) ?: run {
+                _phoneState.value = TargetPhoneState.Error("Failed to open USB Device port.")
+                return@withContext false
+            }
+
+            var bulkIn: UsbEndpoint? = null
+            var bulkOut: UsbEndpoint? = null
+            var claimedIface: UsbInterface? = null
+
+            for (i in 0 until targetDevice.interfaceCount) {
+                val iface = targetDevice.getInterface(i)
+                var tempIn: UsbEndpoint? = null
+                var tempOut: UsbEndpoint? = null
+                for (j in 0 until iface.endpointCount) {
+                    val ep = iface.getEndpoint(j)
+                    if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                        if (ep.direction == UsbConstants.USB_DIR_IN) tempIn = ep else tempOut = ep
+                    }
+                }
+                if (tempIn != null && tempOut != null) {
+                    claimedIface = iface
+                    bulkIn = tempIn
+                    bulkOut = tempOut
+                    break
                 }
             }
+
+            if (claimedIface == null || bulkIn == null || bulkOut == null) {
+                connection.close()
+                val mode = detectDeviceMode(targetDevice)
+                val vidPidStr = String.format("0x%04X:0x%04X", targetDevice.vendorId, targetDevice.productId)
+                _phoneState.value = TargetPhoneState.Connected(
+                    deviceName = targetDevice.productName ?: "USB Device",
+                    mode = mode,
+                    isBromMode = (mode == UsbDeviceMode.BROM),
+                    vidPid = "$vidPidStr [${mode.label}]",
+                    fileDescriptor = -1
+                )
+                return@withContext true
+            }
+
+            // Release previous if open
+            usbInterface?.let { usbConnection?.releaseInterface(it) }
+            usbConnection?.close()
+
+            connection.claimInterface(claimedIface, true)
+            usbConnection = connection
+            usbInterface = claimedIface
+            inEndpoint = bulkIn
+            outEndpoint = bulkOut
+            currentDevice = targetDevice
+
+            val mode = detectDeviceMode(targetDevice)
+            val isBrom = (mode == UsbDeviceMode.BROM)
+            val vidPidStr = String.format("0x%04X:0x%04X", targetDevice.vendorId, targetDevice.productId)
+            val rawFd = connection.fileDescriptor
+
+            val state = TargetPhoneState.Connected(
+                deviceName = targetDevice.productName ?: "MediaTek Device",
+                mode = mode,
+                isBromMode = isBrom,
+                vidPid = "$vidPidStr [${mode.label}]",
+                fileDescriptor = rawFd
+            )
+            _phoneState.value = state
+            onDeviceAutoConnectedListener?.invoke(state)
+            return@withContext true
+        } catch (e: Exception) {
+            _phoneState.value = TargetPhoneState.Error("USB Open Exception: ${e.message}")
+            return@withContext false
+        } finally {
+            isConnecting.set(false)
         }
+    }
 
-        // 2. APK Assets (assets/da/, assets/loaders/, assets/)
-        val assetPaths = listOf(
-            "da/$cleanName",
-            "loaders/$cleanName",
-            cleanName
-        )
-
-        for (path in assetPaths) {
-            try {
-                context.assets.open(path).use { stream: InputStream ->
-                    val bytes = stream.readBytes()
-                    if (bytes.size >= MIN_DA_CONTAINER_SIZE) return bytes
-                }
-            } catch (_: Exception) {}
+    fun flush(timeoutMs: Int = 15): Int {
+        val conn = usbConnection ?: return 0
+        val ep = inEndpoint ?: return 0
+        val tempBuf = ByteArray(1024)
+        var totalFlushed = 0
+        while (true) {
+            val r = conn.bulkTransfer(ep, tempBuf, tempBuf.size, timeoutMs)
+            if (r > 0) totalFlushed += r else break
         }
-
-        return null
+        return totalFlushed
     }
 
     /**
-     * Loads Preloader binary bytes.
+     * BROM Handshake Sync: 0xA0->0x5F, 0x0A->0xF5, 0x50->0xAF, 0x05->0xFA
      */
-    fun loadPreloaderBytes(context: Context, preloaderFileName: String): ByteArray? {
-        val cleanName = preloaderFileName.trim()
+    suspend fun blastBromHandshakeSync(maxAttempts: Int = 60): Boolean = withContext(Dispatchers.IO) {
+        val conn = usbConnection ?: return@withContext false
+        val outEp = outEndpoint ?: return@withContext false
+        val inEp = inEndpoint ?: return@withContext false
 
-        val extFile = File("$EXTERNAL_BASE_PATH/preloaders/$cleanName")
-        if (extFile.exists() && extFile.canRead()) {
-            return try { extFile.readBytes() } catch (_: Exception) { null }
-        }
+        flush(20)
 
-        val assetPaths = listOf("preloaders/$cleanName", cleanName)
-        for (path in assetPaths) {
-            try {
-                context.assets.open(path).use { stream: InputStream ->
-                    val bytes = stream.readBytes()
-                    if (bytes.isNotEmpty()) return bytes
+        val rxBuf = ByteArray(1)
+        val sendA0 = byteArrayOf(0xA0.toByte())
+        var syncedA0 = false
+
+        for (attempt in 0 until maxAttempts) {
+            val w = conn.bulkTransfer(outEp, sendA0, 1, 100)
+            if (w == 1) {
+                val r = conn.bulkTransfer(inEp, rxBuf, 1, 100)
+                if (r == 1 && rxBuf[0] == 0x5F.toByte()) {
+                    syncedA0 = true
+                    break
                 }
-            } catch (_: Exception) {}
+            }
+            delay(10)
         }
 
-        return null
+        if (!syncedA0) return@withContext false
+
+        val send0A = byteArrayOf(0x0A.toByte())
+        if (conn.bulkTransfer(outEp, send0A, 1, 150) != 1) return@withContext false
+        if (conn.bulkTransfer(inEp, rxBuf, 1, 150) != 1 || rxBuf[0] != 0xF5.toByte()) return@withContext false
+
+        val send50 = byteArrayOf(0x50.toByte())
+        if (conn.bulkTransfer(outEp, send50, 1, 150) != 1) return@withContext false
+        if (conn.bulkTransfer(inEp, rxBuf, 1, 150) != 1 || rxBuf[0] != 0xAF.toByte()) return@withContext false
+
+        val send05 = byteArrayOf(0x05.toByte())
+        if (conn.bulkTransfer(outEp, send05, 1, 150) != 1) return@withContext false
+        if (conn.bulkTransfer(inEp, rxBuf, 1, 150) != 1 || rxBuf[0] != 0xFA.toByte()) return@withContext false
+
+        return@withContext true
     }
+
+    fun writeRaw(bytes: ByteArray, timeoutMs: Int = 1000): Int {
+        val conn = usbConnection ?: return -1
+        val ep = outEndpoint ?: return -1
+        return conn.bulkTransfer(ep, bytes, bytes.size, timeoutMs)
+    }
+
+    fun readRaw(buffer: ByteArray, timeoutMs: Int = 1000): Int {
+        val conn = usbConnection ?: return -1
+        val ep = inEndpoint ?: return -1
+        return conn.bulkTransfer(ep, buffer, buffer.size, timeoutMs)
+    }
+
+    fun controlTransfer(requestType: Int, request: Int, value: Int, index: Int, buffer: ByteArray?, length: Int, timeoutMs: Int = 1000): Int {
+        val conn = usbConnection ?: return -1
+        return conn.controlTransfer(requestType, request, value, index, buffer, length, timeoutMs)
+    }
+
+    fun sendWatchdogResetControl(): Boolean {
+        val conn = usbConnection ?: return false
+        val res = conn.controlTransfer(0x40, 0x01, 0, 0, null, 0, 1000)
+        return res >= 0
+    }
+
+    fun disconnect() {
+        try {
+            usbInterface?.let { usbConnection?.releaseInterface(it) }
+            usbConnection?.close()
+        } catch (_: Exception) {}
+        usbConnection = null
+        usbInterface = null
+        inEndpoint = null
+        outEndpoint = null
+        currentDevice = null
+        _phoneState.value = TargetPhoneState.Disconnected
+    }
+
+    fun unregister() {
+        try { context.unregisterReceiver(usbReceiver) } catch (_: Exception) {}
+    }
+
+    fun isConnected(): Boolean = usbConnection != null
 }
