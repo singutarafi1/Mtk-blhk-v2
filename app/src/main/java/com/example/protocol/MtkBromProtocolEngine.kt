@@ -156,7 +156,6 @@ class MtkBromProtocolEngine(
     private suspend fun readBromLengthData(cmd: Byte): ByteArray? {
         if (!sendCmdWithEcho(cmd, 500)) return null
 
-        // Read 4-byte big-endian length
         val lenBuf = ByteArray(4)
         if (targetPhoneUsb.readRaw(lenBuf, 1000) < 4) return null
         val length = ((lenBuf[0].toInt() and 0xFF) shl 24) or
@@ -177,7 +176,6 @@ class MtkBromProtocolEngine(
 
         if (received < length) return null
 
-        // Read 2-byte status
         val statusBuf = ByteArray(2)
         targetPhoneUsb.readRaw(statusBuf, 1000)
         return data
@@ -198,7 +196,6 @@ class MtkBromProtocolEngine(
             log("[-] Failed to read HW code from BROM.", LogLevel.ERROR)
             return false
         }
-
         log("[DA READY] Detected HW Code: 0x%04X".format(hwCode), LogLevel.SUCCESS)
 
         // 3. Find chip config
@@ -206,7 +203,25 @@ class MtkBromProtocolEngine(
             ?: MtkChipConfigDatabase.findConfig(0x0766)!!
         currentChipConfig = chipConfig
 
-        // 4. Load DA payload from assets (Priority: MTK_DA_V5 > MTK_AllInOne > Payload)
+        // 4. Execute Auth / SLA / Security Bypass before uploading DA
+        log("[DA READY] Executing Security SLA/DAA Bypass for ${chipConfig.name}...", LogLevel.INFO)
+        val bypassRes = securityEngine.executeBypass(
+            MtkChipInfo(
+                chipIdHex = chipConfig.name,
+                hwCodeHex = "0x%04X".format(hwCode),
+                hwSubcodeHex = "0x0000",
+                hwVersionHex = "0x0000",
+                swVersionHex = "0x0000",
+                secureBootEnabled = true,
+                daLoaded = false,
+                bromState = "BROM_CONNECTED"
+            )
+        )
+        if (bypassRes.isFailure) {
+            log("[-] Security Bypass Warning: ${bypassRes.exceptionOrNull()?.message}", LogLevel.WARNING)
+        }
+
+        // 5. Load DA payload from assets (Priority: MTK_DA_V5 > MTK_AllInOne > Payload)
         var daBytes = MtkAssetManager.loadDaBytes(context, "MTK_DA_V5.bin")
             ?: MtkAssetManager.loadDaBytes(context, "MTK_AllInOne_DA.bin")
         if (daBytes == null || daBytes.size < 32) {
@@ -218,8 +233,8 @@ class MtkBromProtocolEngine(
             return false
         }
 
-        // 5. Parse DA
-        val daInfo = MtkDaParser.parseDaLoader(daBytes, hwCode)
+        // 6. Parse DA
+        val daInfo = MtkDaParser.parseDaLoader(daBytes, hwCode, defaultLoadAddr = chipConfig.daPayloadAddr)
         if (daInfo == null) {
             log("[-] Failed to parse DA binary.", LogLevel.ERROR)
             return false
@@ -233,7 +248,7 @@ class MtkBromProtocolEngine(
 
         val daAddress1 = daInfo.stage1?.startAddress ?: chipConfig.daPayloadAddr
 
-        // 6. Upload DA Stage 1
+        // 7. Upload DA Stage 1
         val uploadResult = MtkDaUploader.sendDa(
             usb = targetPhoneUsb,
             daAddress = daAddress1,
@@ -257,7 +272,7 @@ class MtkBromProtocolEngine(
             return false
         }
 
-        // 7. Jump to Stage 1 DA
+        // 8. Jump to Stage 1 DA
         val jumpResult = MtkDaUploader.jumpDa(
             usb = targetPhoneUsb,
             daAddress = daAddress1,
@@ -269,7 +284,7 @@ class MtkBromProtocolEngine(
             return false
         }
 
-        // 8. Wait for Stage 1 sync (0xC0)
+        // 9. Wait for Stage 1 sync (0xC0)
         delay(100)
         val syncByte = ByteArray(1)
         val readSync = targetPhoneUsb.readRaw(syncByte, 2000)
@@ -280,21 +295,21 @@ class MtkBromProtocolEngine(
         }
         log("[+] DA Stage 1 sync (0xC0) received.", LogLevel.SUCCESS)
 
-        // 9. Extract DA Stage 2
+        // 10. Extract DA Stage 2
         val stage2Bytes = daInfo.getStage2Bytes()
         if (stage2Bytes == null || stage2Bytes.isEmpty()) {
             log("[-] No DA Stage 2 region found in container. Raw Stage 1 only mode is not supported for XFlash.", LogLevel.ERROR)
             return false
         }
 
-        // 10. Initialize XFlash Engine and Handshake
+        // 11. Initialize XFlash Engine and Handshake
         val xf = MtkXFlashEngine(targetPhoneUsb) { log(it.message, it.level) }
         if (!xf.connect()) {
             log("[-] XFlash Connect Handshake failed. DA Stage 1 may not be responding.", LogLevel.ERROR)
             return false
         }
 
-        // 11. Upload Stage 2 via BOOT_TO
+        // 12. Upload Stage 2 via BOOT_TO
         val daAddress2 = daInfo.stage2?.startAddress ?: 0x40000000L
         if (!xf.bootTo(daAddress2, stage2Bytes) { written, total ->
             val fraction = written.toFloat() / total.toFloat()
@@ -332,7 +347,6 @@ class MtkBromProtocolEngine(
             val hwCodeVal = readHwCode() ?: return Result.failure(IllegalStateException("Failed to read HW Code"))
             val hwCodeStr = "0x%04X".format(hwCodeVal)
 
-            // Read HW/SW Ver using 0xFC (returns 8 bytes)
             var hwSubCode = "0x8A00"
             var hwVer = "0xCA00"
             var swVer = "0x0000"
@@ -348,7 +362,6 @@ class MtkBromProtocolEngine(
             val chipConfig = MtkChipConfigDatabase.findConfig(hwCodeVal) ?: MtkChipConfigDatabase.findConfig(0x0766)!!
             currentChipConfig = chipConfig
 
-            // Security config
             var isSecBoot = false
             var isSlaActive = false
             var isDaaActive = false
@@ -365,14 +378,12 @@ class MtkBromProtocolEngine(
                 }
             }
 
-            // MEID
             var meidStr = "UNKNOWN"
             if (sendCmdWithEcho(CMD_GET_ME_ID, 500)) {
                 val meidBuf = readBromLengthData(CMD_GET_ME_ID)
                 if (meidBuf != null) meidStr = meidBuf.joinToString("") { "%02X".format(it) }
             }
 
-            // SOC ID
             var socIdStr = "UNKNOWN"
             if (sendCmdWithEcho(CMD_GET_SOC_ID, 500)) {
                 val socIdBuf = readBromLengthData(CMD_GET_SOC_ID)
