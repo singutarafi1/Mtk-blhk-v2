@@ -31,13 +31,6 @@ class MtkSecurityBypassEngine(
         logCallback(TerminalLog("", message, level))
     }
 
-    /**
-     * Executes MediaTek Security Bypass:
-     * Mode 1 (MT6765, MT6768, MT6833, etc.):
-     * 1. Kamakiri2 USB Line Coding Exploit
-     * 2. CQDMA Blacklist Security Registers Override (Patch to 0x00000000)
-     * 3. Flush USB Pipe & Unlock BootROM (No SRAM payload jump required).
-     */
     suspend fun executeBypass(
         context: Context,
         deviceInfo: MtkChipInfo?,
@@ -55,7 +48,56 @@ class MtkSecurityBypassEngine(
         log("CQDMA Base: 0x%08X | Watchdog: 0x%08X".format(chipConfig.cqdmaBase ?: 0L, chipConfig.watchdog), LogLevel.INFO)
 
         try {
-            // STEP 1: Deploy Kamakiri2 Line Coding Exploit
+            // [FIX]: 1. Load Payload from Assets based on HW Code
+            val payloadFileName = when (chipConfig.hwCode) {
+                0x0766 -> "payloads/mt6765_payload.bin"
+                0x0989 -> "payloads/mt6833_payload.bin"
+                else -> null
+            }
+
+            var payloadBytes: ByteArray? = null
+            if (payloadFileName != null) {
+                try {
+                    payloadBytes = context.assets.open(payloadFileName).use { it.readBytes() }
+                    log("Loaded exploit payload: $payloadFileName (${payloadBytes.size} bytes)", LogLevel.INFO)
+                } catch (e: Exception) {
+                    log("[-] Payload file $payloadFileName not found in assets!", LogLevel.WARNING)
+                }
+            }
+
+            // [FIX]: 2. Write Payload to BROM Memory (SRAM) before Exploit
+            if (payloadBytes != null && payloadBytes.isNotEmpty()) {
+                log("Uploading Payload to SRAM 0x%08X...".format(chipConfig.bromPayloadAddr), LogLevel.INFO)
+                
+                // Ensure payload is a multiple of 4 for DWORD writing
+                val paddedSize = (payloadBytes.size + 3) and inv(3)
+                val buffer = ByteBuffer.allocate(paddedSize).order(ByteOrder.LITTLE_ENDIAN)
+                buffer.put(payloadBytes)
+                buffer.position(0)
+
+                var currentAddr = chipConfig.bromPayloadAddr
+                var successUpload = true
+                
+                while (buffer.hasRemaining()) {
+                    val value = buffer.int.toLong() and 0xFFFFFFFFL
+                    if (!writeRegister32(currentAddr, value)) {
+                        successUpload = false
+                        break
+                    }
+                    currentAddr += 4
+                }
+                
+                if (successUpload) {
+                    log("[+] Payload successfully staged in SRAM.", LogLevel.SUCCESS)
+                } else {
+                    log("[-] Failed to write payload to SRAM.", LogLevel.ERROR)
+                    return@withContext Result.failure(IllegalStateException("Payload upload failed"))
+                }
+            } else {
+                log("[-] No payload injected! Bypass may fail with 0x1D0D.", LogLevel.WARNING)
+            }
+
+            // STEP 3: Deploy Kamakiri2 Line Coding Exploit (This will execute the uploaded payload)
             log("[1/2] Configuring USB Exploit Interface (Kamakiri2)...", LogLevel.INFO)
             val kamakiri = MtkKamakiriExploit(usb) { msg, lvl -> log(msg, lvl) }
             val exploitSuccess = kamakiri.exploitKamakiri2(chipConfig.bromPayloadAddr)
@@ -66,14 +108,13 @@ class MtkSecurityBypassEngine(
                 log("[+] Kamakiri2 Interface Configured Successfully.", LogLevel.SUCCESS)
             }
 
-            // [CRITICAL FIX]: Kamakiri Exploit လုပ်ပြီးသည်နှင့် USB Endpoint သည် STALL (ပိတ်ဆို့) သွားပါသည်။
-            // မဖြစ်မနေ Clear Halt လုပ်ပေးမှသာ နောက်ထပ် CQDMA Command များ အလုပ်လုပ်ပါမည်။
+            // [CRITICAL FIX]: Clear USB Endpoint Halt caused by Exploit
             log("Clearing USB Endpoint Halt state after exploit...", LogLevel.INFO)
             usb.clearEndpointHalt()
             usb.flush(50)
             delay(50)
 
-            // STEP 2: Disable BootROM Blacklist via CQDMA Controller
+            // STEP 4: Disable BootROM Blacklist via CQDMA Controller
             log("[2/2] Overriding BootROM Range Blacklist via CQDMA...", LogLevel.INFO)
             val cqdma = MtkCqdmaEngine(
                 read32Func = { addr -> readRegister32(addr) },
@@ -86,7 +127,6 @@ class MtkSecurityBypassEngine(
                 log("[-] CQDMA Blacklist patch warning. Verifying BROM status...", LogLevel.WARNING)
             } 
             
-            // DA Stage သို့ မကူးမီ USB Pipe ထဲမှ အမှိုက်များ ရှင်းလင်းရန်
             usb.flush(15)
 
             log("==================================================", LogLevel.SUCCESS)
@@ -99,6 +139,8 @@ class MtkSecurityBypassEngine(
             return@withContext Result.failure(e)
         }
     }
+
+    private fun inv(value: Int): Int = value.inv()
 
     private fun echoBytes(data: ByteArray, timeoutMs: Int = 300): Boolean {
         if (usb.writeRaw(data, timeoutMs) != data.size) return false
