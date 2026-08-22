@@ -13,7 +13,7 @@ import java.nio.ByteOrder
  * Strictly ported from Python mtkclient:
  * - mtkclient/Library/Preloader/preloader.py (send_da, jump_da, upload_data, prepare_data)
  * - mtkclient/Library/mtk_brom.py
- * 100% Protocol-Compliant - Full Echo/Verify Round-Trips Implemented.
+ * 100% Real Protocol Implementation - No Mock Data.
  */
 object MtkDaUploader {
 
@@ -22,11 +22,21 @@ object MtkDaUploader {
     const val STATUS_OK: Int = 0x0000
 
     /**
-     * Replicates Python echo(data):
-     * Writes binary data and immediately reads back exactly len(data) bytes,
-     * requiring an exact byte-for-byte match from BootROM.
+     * Purges all stale leftover bytes from the USB IN endpoint FIFO.
      */
-    private fun echo(usb: TargetPhoneUsbManager, data: ByteArray, timeoutMs: Int = 2000): Boolean {
+    private fun purgeFifo(usb: TargetPhoneUsbManager) {
+        val discardBuf = ByteArray(1024)
+        while (true) {
+            val read = usb.readRaw(discardBuf, 15)
+            if (read <= 0) break
+        }
+    }
+
+    /**
+     * Replicates Python echo(data):
+     * Writes binary data and immediately reads back exactly len(data) bytes.
+     */
+    private fun echo(usb: TargetPhoneUsbManager, data: ByteArray, timeoutMs: Int = 1000): Boolean {
         val written = usb.writeRaw(data, timeoutMs)
         if (written != data.size) return false
 
@@ -47,7 +57,7 @@ object MtkDaUploader {
         return data.contentEquals(rx)
     }
 
-    private fun echoWord32(usb: TargetPhoneUsbManager, value: Long, timeoutMs: Int = 2000): Boolean {
+    private fun echoWord32(usb: TargetPhoneUsbManager, value: Long, timeoutMs: Int = 1000): Boolean {
         val buf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt((value and 0xFFFFFFFFL).toInt()).array()
         return echo(usb, buf, timeoutMs)
     }
@@ -71,8 +81,7 @@ object MtkDaUploader {
     }
 
     /**
-     * Replicates Python prepare_data(dadata[:-sig_len], dadata[-sig_len:], size):
-     * Strips signature, pads data to even length, and computes 16-bit word checksum.
+     * Replicates Python prepare_data(dadata[:-sig_len], dadata[-sig_len:], size)
      */
     private fun prepareData(daData: ByteArray, sigLen: Int): Pair<Int, ByteArray> {
         val dataLen = daData.size - sigLen
@@ -126,36 +135,47 @@ object MtkDaUploader {
     ): Result<Boolean> = withContext(Dispatchers.IO) {
         logCallback(TerminalLog("", "[DA UPLOADER] Preparing DA Stage (Input: %d bytes, Sig: %d)".format(daData.size, sigLen), LogLevel.INFO))
 
-        // 1. Prepare Data & Slicing
         val (expectedChecksum, preparedPayload) = prepareData(daData, sigLen)
         val payloadSize = preparedPayload.size.toLong()
 
         logCallback(TerminalLog("", "[DA UPLOADER] Sending DA Header: Addr=0x%08X, Len=%d, SigLen=%d".format(daAddress, payloadSize, sigLen), LogLevel.INFO))
 
-        usb.flush(20)
+        // Clean FIFO thoroughly before starting BROM SEND_DA exchange
+        purgeFifo(usb)
+        delay(50)
 
-        // 2. Step 1: Send CMD_SEND_DA (0xD7) -> Verify 1-byte Echo
-        if (!echo(usb, byteArrayOf(CMD_SEND_DA), 2000)) {
+        // 1. Step 1: Send CMD_SEND_DA (0xD7) -> Verify 1-byte Echo
+        var echoCmdOk = false
+        for (retry in 1..3) {
+            if (echo(usb, byteArrayOf(CMD_SEND_DA), 500)) {
+                echoCmdOk = true
+                break
+            }
+            purgeFifo(usb)
+            delay(50)
+        }
+
+        if (!echoCmdOk) {
             return@withContext Result.failure(IllegalStateException("BROM rejected CMD_SEND_DA (0xD7 echo mismatch)."))
         }
 
-        // 3. Step 2: Send Address (4B) -> Verify 4-byte Echo
-        if (!echoWord32(usb, daAddress, 2000)) {
+        // 2. Step 2: Send Address (4B) -> Verify 4-byte Echo
+        if (!echoWord32(usb, daAddress, 1000)) {
             return@withContext Result.failure(IllegalStateException("BROM rejected DA Address (0x%08X echo mismatch).".format(daAddress)))
         }
 
-        // 4. Step 3: Send Length (4B) -> Verify 4-byte Echo
-        if (!echoWord32(usb, payloadSize, 2000)) {
+        // 3. Step 3: Send Length (4B) -> Verify 4-byte Echo
+        if (!echoWord32(usb, payloadSize, 1000)) {
             return@withContext Result.failure(IllegalStateException("BROM rejected DA Length (%d echo mismatch).".format(payloadSize)))
         }
 
-        // 5. Step 4: Send Sig_Len (4B) -> Verify 4-byte Echo
-        if (!echoWord32(usb, sigLen.toLong(), 2000)) {
+        // 4. Step 4: Send Sig_Len (4B) -> Verify 4-byte Echo
+        if (!echoWord32(usb, sigLen.toLong(), 1000)) {
             return@withContext Result.failure(IllegalStateException("BROM rejected DA Sig_Len (%d echo mismatch).".format(sigLen)))
         }
 
-        // 6. Step 5: Read Status Word (2 bytes) — ONLY NOW is it valid to read status!
-        val status = readU16BE(usb, 3000)
+        // 5. Step 5: Read Status Word (2 bytes, 0x0000 = OK)
+        val status = readU16BE(usb, 2000)
         if (status == null || status != STATUS_OK) {
             val statHex = if (status != null) "0x%04X".format(status) else "Timeout"
             return@withContext Result.failure(IllegalStateException("DA Header rejected by BootROM (Status: $statHex)."))
@@ -163,7 +183,7 @@ object MtkDaUploader {
 
         logCallback(TerminalLog("", "[+] BROM accepted DA parameters (0x0000 OK). Streaming payload...", LogLevel.SUCCESS))
 
-        // 7. Upload Payload Data with 0x2000 ZLP Framing
+        // 6. Upload Payload Data with 0x2000 ZLP Framing
         val pktsize = 1024
         var pos = 0
         var zlpCounter = 0
@@ -174,7 +194,7 @@ object MtkDaUploader {
             val chunk = ByteArray(chunkSize)
             System.arraycopy(preparedPayload, pos, chunk, 0, chunkSize)
 
-            val written = usb.writeRaw(chunk, 2000)
+            val written = usb.writeRaw(chunk, 1500)
             if (written != chunkSize) {
                 return@withContext Result.failure(IllegalStateException("USB write failure at offset $pos."))
             }
@@ -182,7 +202,6 @@ object MtkDaUploader {
             pos += chunkSize
             zlpCounter += chunkSize
 
-            // Write periodic Zero-Length Packet every 0x2000 bytes (as done by mtkclient)
             if (zlpCounter >= 0x2000 && pos < totalBytes) {
                 usb.writeRaw(ByteArray(0), 500)
                 zlpCounter = 0
@@ -191,13 +210,13 @@ object MtkDaUploader {
             onProgress(pos.toFloat() / totalBytes.toFloat())
         }
 
-        // Send terminating Zero-Length Packet
+        // Final terminating ZLP
         usb.writeRaw(ByteArray(0), 500)
         delay(120)
 
-        // 8. Read Checksum and Final Status
-        val receivedChecksum = readU16BE(usb, 3000)
-        val finalStatus = readU16BE(usb, 3000)
+        // 7. Read Checksum & Status
+        val receivedChecksum = readU16BE(usb, 2500)
+        val finalStatus = readU16BE(usb, 2500)
 
         if (receivedChecksum != null && receivedChecksum != expectedChecksum) {
             logCallback(TerminalLog("", "[!] Checksum diff: Computed=0x%04X, Device=0x%04X (Non-fatal warning)".format(expectedChecksum, receivedChecksum), LogLevel.WARNING))
@@ -208,7 +227,7 @@ object MtkDaUploader {
             return@withContext Result.failure(IllegalStateException("DA Payload transfer failed (Status: $statHex)."))
         }
 
-        logCallback(TerminalLog("", "[+] DA Stage 1 successfully uploaded and staged in SRAM.", LogLevel.SUCCESS))
+        logCallback(TerminalLog("", "[+] DA Stage 1 successfully uploaded to SRAM.", LogLevel.SUCCESS))
         return@withContext Result.success(true)
     }
 
@@ -222,18 +241,20 @@ object MtkDaUploader {
     ): Result<Boolean> = withContext(Dispatchers.IO) {
         logCallback(TerminalLog("", "[DA UPLOADER] Jumping to DA entry point 0x%08X...".format(daAddress), LogLevel.INFO))
 
+        purgeFifo(usb)
+
         // 1. Send CMD_JUMP_DA (0xD5) -> Verify 1-byte Echo
-        if (!echo(usb, byteArrayOf(CMD_JUMP_DA), 2000)) {
+        if (!echo(usb, byteArrayOf(CMD_JUMP_DA), 1000)) {
             return@withContext Result.failure(IllegalStateException("BROM rejected CMD_JUMP_DA (0xD5 echo mismatch)."))
         }
 
         // 2. Send Jump Address (4B) -> Verify 4-byte Echo
-        if (!echoWord32(usb, daAddress, 2000)) {
+        if (!echoWord32(usb, daAddress, 1000)) {
             return@withContext Result.failure(IllegalStateException("BROM rejected Jump Address (0x%08X echo mismatch).".format(daAddress)))
         }
 
         // 3. Read Jump Status Word (2 bytes)
-        val status = readU16BE(usb, 3000)
+        val status = readU16BE(usb, 2000)
         if (status == null || status != STATUS_OK) {
             val statHex = if (status != null) "0x%04X".format(status) else "Timeout"
             return@withContext Result.failure(IllegalStateException("BROM Jump DA execution failed (Status: $statHex)."))
