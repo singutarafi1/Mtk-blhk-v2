@@ -1,4 +1,4 @@
-Package com.example.protocol
+package com.example.protocol
 
 import android.content.Context
 import com.example.model.LogLevel
@@ -176,4 +176,3 @@ class MtkSecurityBypassEngine(
         return status2 <= 0xFF
     }
 }
-
