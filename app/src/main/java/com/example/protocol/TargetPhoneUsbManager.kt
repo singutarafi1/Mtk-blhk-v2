@@ -94,7 +94,10 @@ class TargetPhoneUsbManager(private val context: Context) {
                         intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
                     }
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    
                     if (granted && device != null) {
+                        // [FIX]: MediaTek ဖုန်းမဟုတ်လျှင် Connection ကို မလုပါနှင့်
+                        if (!isMediaTekDevice(device)) return
                         if (strictBromOnlyMode && !isBromDevice(device)) return
                         scope.launch { connectDevice(device) }
                     } else {
@@ -109,6 +112,9 @@ class TargetPhoneUsbManager(private val context: Context) {
                         intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
                     }
                     if (device != null) {
+                        // [FIX]: MediaTek (Supported VID) မဟုတ်သော OTG ခေါင်းများကို လျစ်လျူရှုပါ
+                        if (!isMediaTekDevice(device)) return
+                        
                         if (strictBromOnlyMode && !isBromDevice(device)) return
                         scope.launch {
                             if (usbManager.hasPermission(device)) connectDevice(device)
@@ -117,9 +123,13 @@ class TargetPhoneUsbManager(private val context: Context) {
                     }
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
-                    isPermissionRequested.set(false)
-                    requestedDeviceKey = null
-                    disconnect()
+                    val detachedDevice: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    // လက်ရှိချိတ်ထားတဲ့ ဖုန်းအစစ် ပြုတ်သွားမှသာ Disconnect လုပ်ပါမည်
+                    if (detachedDevice != null && currentDevice?.deviceId == detachedDevice.deviceId) {
+                        isPermissionRequested.set(false)
+                        requestedDeviceKey = null
+                        disconnect()
+                    }
                 }
             }
         }
@@ -294,8 +304,6 @@ class TargetPhoneUsbManager(private val context: Context) {
         val outEp = outEndpoint ?: return false
 
         try {
-            // Android requires the clean endpoint address without corrupted flags, 
-            // or we use standard clear feature with masked endpoint address (mask 0x0F).
             val outAddress = outEp.address and 0x0F or if (outEp.direction == UsbConstants.USB_DIR_IN) 0x80 else 0x00
             val inAddress = inEp.address and 0x0F or if (inEp.direction == UsbConstants.USB_DIR_IN) 0x80 else 0x00
 
