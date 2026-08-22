@@ -286,8 +286,7 @@ class TargetPhoneUsbManager(private val context: Context) {
     }
 
     /**
-     * Resets USB Endpoint Halt (STALL) condition created by Kamakiri exploit.
-     * Replicates Python libusb_clear_halt() via Standard USB CLEAR_FEATURE request.
+     * Resets USB Endpoint Halt (STALL) condition safely for Android.
      */
     fun clearEndpointHalt(): Boolean {
         val conn = usbConnection ?: return false
@@ -295,9 +294,13 @@ class TargetPhoneUsbManager(private val context: Context) {
         val outEp = outEndpoint ?: return false
 
         try {
-            // Standard USB CLEAR_FEATURE (0x01), ENDPOINT_HALT (0x00), Target: Endpoint Address
-            conn.controlTransfer(0x02, 0x01, 0x0000, outEp.address, null, 0, 500)
-            conn.controlTransfer(0x02, 0x01, 0x0000, inEp.address, null, 0, 500)
+            // Android requires the clean endpoint address without corrupted flags, 
+            // or we use standard clear feature with masked endpoint address (mask 0x0F).
+            val outAddress = outEp.address and 0x0F or if (outEp.direction == UsbConstants.USB_DIR_IN) 0x80 else 0x00
+            val inAddress = inEp.address and 0x0F or if (inEp.direction == UsbConstants.USB_DIR_IN) 0x80 else 0x00
+
+            conn.controlTransfer(0x02, 0x01, 0x0000, outAddress, null, 0, 500)
+            conn.controlTransfer(0x02, 0x01, 0x0000, inAddress, null, 0, 500)
 
             usbInterface?.let {
                 conn.releaseInterface(it)
