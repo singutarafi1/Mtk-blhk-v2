@@ -11,7 +11,7 @@ import java.nio.ByteOrder
 /**
  * MediaTek Download Agent (DA) Upload Pipeline
  * Strictly ported from Python mtkclient: mtk_daloader.py & mtk_brom.py
- * Pure Native Implementation - No Mock Data.
+ * Fixed for Android Native USB Host API compatibility.
  */
 object MtkDaUploader {
 
@@ -19,6 +19,10 @@ object MtkDaUploader {
     const val CMD_JUMP_DA: Byte = 0xD5.toByte()
     const val STATUS_OK: Int = 0x0000
 
+    /**
+     * Writes [data] then reads back the same number of bytes, verifying the
+     * device echoed them exactly. Mirrors mtkclient's Preloader.echo().
+     */
     private fun echoBytes(usb: TargetPhoneUsbManager, data: ByteArray, timeoutMs: Int = 1000): Boolean {
         if (usb.writeRaw(data, timeoutMs) != data.size) return false
         val echo = ByteArray(data.size)
@@ -67,12 +71,24 @@ object MtkDaUploader {
         logCallback: (TerminalLog) -> Unit,
         onProgress: (Float) -> Unit
     ): Result<Boolean> = withContext(Dispatchers.IO) {
+        // 0. Prepare payload
         val hasSig = sigLen in 1..daData.size
         val body = if (hasSig) daData.copyOfRange(0, daData.size - sigLen) else daData
         val sigTail = if (hasSig) daData.copyOfRange(daData.size - sigLen, daData.size) else ByteArray(0)
         var payload = body + sigTail
+        
+        // Ensure 16-bit word alignment
         if (payload.size % 2 != 0) payload += byteArrayOf(0)
+        
+        // [ANDROID FIX]: Zero-Length Packet (ZLP) workaround.
+        // Android USB Host API does not reliably send length=0 packets.
+        // If the payload is exactly divisible by maxPacketSize, BROM expects a ZLP.
+        // To prevent this, we pad with 2 dummy bytes to break the exact multiplier.
+        if (maxPacketSize > 0 && payload.size % maxPacketSize == 0) {
+            payload += byteArrayOf(0, 0)
+        }
 
+        // Compute 16-bit XOR checksum
         var genChecksum = 0
         var ci = 0
         while (ci < payload.size) {
@@ -84,46 +100,43 @@ object MtkDaUploader {
 
         logCallback(TerminalLog("", "[DA UPLOADER] Sending DA Stage to 0x%08X (Size: %d bytes, Sig: %d)".format(daAddress, payload.size, sigLen), LogLevel.INFO))
 
-        usb.clearEndpointHalt()
-        usb.flush(20)
+        // [ANDROID FIX]: DO NOT call clearEndpointHalt() here, it desyncs the DATA0/DATA1 toggle.
+        usb.flush(50)
         delay(50)
 
-        var echoOk = false
-        for (attempt in 1..3) {
-            if (echoBytes(usb, byteArrayOf(CMD_SEND_DA), 1000)) {
-                echoOk = true
-                break
-            }
-            usb.clearEndpointHalt()
-            usb.flush(20)
-            delay(100)
-        }
-        if (!echoOk) {
+        // 1. Send CMD_SEND_DA (0xD7), echo-verified 
+        // [ANDROID FIX]: Removed Retry Loop to prevent overlapping BROM states.
+        if (!echoBytes(usb, byteArrayOf(CMD_SEND_DA), 1000)) {
             return@withContext Result.failure(IllegalStateException("Failed writing CMD_SEND_DA command byte to USB (echo mismatch)."))
         }
 
+        // 2. Address (4B BE), echo-verified
         val addrBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
             .putInt((daAddress and 0xFFFFFFFFL).toInt()).array()
         if (!echoBytes(usb, addrBytes, 1000)) {
             return@withContext Result.failure(IllegalStateException("Failed writing DA address to USB (echo mismatch)."))
         }
 
+        // 3. Length of the PREPARED payload (4B BE), echo-verified
         val lenBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(payload.size).array()
         if (!echoBytes(usb, lenBytes, 1000)) {
             return@withContext Result.failure(IllegalStateException("Failed writing DA length to USB (echo mismatch)."))
         }
 
+        // 4. SigLen (4B BE), echo-verified
         val sigLenBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(sigLen).array()
         if (!echoBytes(usb, sigLenBytes, 1000)) {
             return@withContext Result.failure(IllegalStateException("Failed writing DA sigLen to USB (echo mismatch)."))
         }
 
+        // 5. Status word
         val status = readU16BE(usb, 2500)
         if (status == null || status > 0xFF) {
             val statHex = if (status != null) "0x%04X".format(status) else "Timeout"
             return@withContext Result.failure(IllegalStateException("DA upload parameter rejected by BootROM (Status: $statHex)."))
         }
 
+        // 6. Stream the prepared payload
         val totalBytes = payload.size
         var offset = 0
         while (offset < totalBytes) {
@@ -136,14 +149,14 @@ object MtkDaUploader {
             }
 
             offset += thisChunk
-            if (offset % 0x2000 == 0) {
-                usb.writeRaw(ByteArray(0), 500)
-            }
             onProgress(offset.toFloat() / totalBytes.toFloat())
+            
+            // [ANDROID FIX]: Removed intermediate 0x2000 and end-of-transfer Zero-Length Packets.
+            // Our payload size padding fix above ensures ZLPs are no longer required.
         }
-        usb.writeRaw(ByteArray(0), 500)
         delay(120)
 
+        // 7. Read checksum + final status
         val checksum = readU16BE(usb, 3000)
         val finalStatus = readU16BE(usb, 3000)
 
@@ -166,11 +179,30 @@ object MtkDaUploader {
     ): Result<Boolean> = withContext(Dispatchers.IO) {
         logCallback(TerminalLog("", "[DA UPLOADER] Jumping to DA entry point 0x%08X...".format(daAddress), LogLevel.INFO))
 
+        // 1. Send CMD_JUMP_DA (0xD5), echo-verified
         if (!echoBytes(usb, byteArrayOf(CMD_JUMP_DA), 1000)) {
             return@withContext Result.failure(IllegalStateException("CMD_JUMP_DA echo mismatch."))
         }
 
-        val addrBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
-            .putInt((daAddress and 0xFFFFFFFFL).toInt()).array()
+        // 2. Send Jump Target Address (4B BE)
+        val addrBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt((daAddress and 0xFFFFFFFFL).toInt()).array()
         if (usb.writeRaw(addrBuf, 1000) != 4) {
-            return@withContext Result.failure(IllegalStateException("Failed writing DA
+            return@withContext Result.failure(IllegalStateException("Failed writing DA jump address."))
+        }
+        val echoedAddr = readU32BE(usb, 1000)
+        if (echoedAddr == null || echoedAddr != (daAddress and 0xFFFFFFFFL)) {
+            val gotHex = if (echoedAddr != null) "0x%08X".format(echoedAddr) else "Timeout"
+            return@withContext Result.failure(IllegalStateException("DA jump address echo mismatch (got $gotHex)."))
+        }
+
+        // 3. Read Execution Status
+        val status = readU16BE(usb, 2500)
+        if (status == null || status != STATUS_OK) {
+            val statHex = if (status != null) "0x%04X".format(status) else "Timeout"
+            return@withContext Result.failure(IllegalStateException("DA jump execution rejected (Status: $statHex)."))
+        }
+
+        logCallback(TerminalLog("", "[DA UPLOADER] DA execution started successfully.", LogLevel.SUCCESS))
+        return@withContext Result.success(true)
+    }
+}
