@@ -590,7 +590,7 @@ class MtkBridgeViewModel(application: Application) : AndroidViewModel(applicatio
                         ServiceFunction.MEMORY_TEST -> protocolEngine.runMemoryTest()
                         ServiceFunction.FORMAT_PARTITION -> {
                             parts.getOrNull(_selectedPartitionIndex.value)?.let { part ->
-                                protocolEngine.formatPartition(chip, part, parts, _autoNvBackup.value, _autoReboot.value)
+                                protocolEngine.formatPartition(part, _autoReboot.value, chip)
                             } ?: Result.failure<Boolean>(IllegalArgumentException("No partition selected"))
                         }
                         ServiceFunction.CRASH_TO_BROM -> protocolEngine.crashToBrom()
