@@ -52,6 +52,7 @@ class MtkBromProtocolEngine(
         const val CMD_WRITE32: Byte = 0xD4.toByte()
         const val CMD_READ32: Byte = 0xD6.toByte()
 
+        // BROM Stage 1 DA Sync ACK
         const val DA_SYNC_ACK: Byte = 0xC0.toByte()
     }
 
@@ -74,17 +75,21 @@ class MtkBromProtocolEngine(
         return (read > 0 && echo[0] == cmd)
     }
 
+    /**
+     * Kills Hardware Watchdog Timer (WDT) to prevent target phone from rebooting during BROM/DA stage.
+     */
     private suspend fun disableWatchdog(wdtAddress: Long = 0x10007000L): Boolean = withContext(Dispatchers.IO) {
         val cmdBuf = ByteBuffer.allocate(9).order(ByteOrder.BIG_ENDIAN)
         cmdBuf.put(CMD_WRITE32)
         cmdBuf.putInt((wdtAddress and 0xFFFFFFFFL).toInt())
-        cmdBuf.putInt(1)
+        cmdBuf.putInt(1) // 1 Dword
 
         if (targetPhoneUsb.writeRaw(cmdBuf.array(), 500) <= 0) return@withContext false
 
         val ack = ByteArray(2)
         targetPhoneUsb.readRaw(ack, 500)
 
+        // MTK WDT Unlock/Disable Key
         val valBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(0x22000000).array()
         if (targetPhoneUsb.writeRaw(valBuf, 500) <= 0) return@withContext false
 
@@ -93,6 +98,9 @@ class MtkBromProtocolEngine(
         return@withContext true
     }
 
+    /**
+     * Actively listens and captures the MTK BROM USB Port during device boot-up.
+     */
     private suspend fun ensureTargetConnected(timeoutSec: Int = 30): Boolean = withContext(Dispatchers.IO) {
         if (targetPhoneUsb.isConnected() && targetPhoneUsb.isBromConnected()) return@withContext true
 
@@ -207,13 +215,16 @@ class MtkBromProtocolEngine(
         return data
     }
 
+    /**
+     * Initializes Download Agent (Stage 1 DA_PL & Stage 2 XFLASH) strictly matching Python mtkclient.
+     */
     private suspend fun ensureDaReady(): Boolean = withContext(Dispatchers.IO) {
         if (daLoaded && xflashEngine != null) return@withContext true
 
         // 1. Establish BROM Connection
         val isReady = ensureTargetConnected()
         if (!isReady || !targetPhoneUsb.isConnected()) {
-            log("[-] DA Load failed: Device not connected.", LogLevel.ERROR)
+            log("[-] DA Load failed: Device not connected in BROM.", LogLevel.ERROR)
             return@withContext false
         }
 
@@ -231,10 +242,11 @@ class MtkBromProtocolEngine(
         // 3. Immediately Kill Watchdog Timer
         disableWatchdog(chipConfig.watchdog)
 
-        // 4. Execute Security SLA/DAA/SBC Bypass
+        // 4. Execute Security SLA/DAA/SBC Bypass (Kamakiri2 + CQDMA + Exploit Payload 624B Jump)
         log("[DA READY] Executing Security SLA/DAA Bypass for ${chipConfig.name}...", LogLevel.INFO)
         val bypassRes = securityEngine.executeBypass(
-            MtkChipInfo(
+            context = context,
+            deviceInfo = MtkChipInfo(
                 chipIdHex = chipConfig.name,
                 hwCodeHex = "0x%04X".format(hwCode),
                 hwSubcodeHex = "0x0000",
@@ -249,7 +261,7 @@ class MtkBromProtocolEngine(
             log("[-] Security Bypass Warning: ${bypassRes.exceptionOrNull()?.message}", LogLevel.WARNING)
         }
 
-        // 5. Exploit အပြီး USB Pipe Re-sync ပြုလုပ်ခြင်း
+        // 5. Re-sync USB pipe after exploit execution
         targetPhoneUsb.flush(50)
         delay(150)
 
@@ -406,8 +418,6 @@ class MtkBromProtocolEngine(
             }
 
             val chipName = resolveChipName(hwCodeStr)
-            val guessedBrand = resolveGuessedDevice(hwCodeStr)
-
             log("[+] Target Platform: $chipName ($hwCodeStr)", LogLevel.CYAN)
             log("[+] Security: SBC [${if (isSecBoot) "ENABLED" else "DISABLED"}] | SLA [${if (isSlaActive) "ACTIVE" else "DISABLED"}] | DAA [${if (isDaaActive) "ACTIVE" else "DISABLED"}]", LogLevel.INFO)
 
@@ -527,11 +537,6 @@ class MtkBromProtocolEngine(
         return@withContext res
     }
 
-    suspend fun formatPartition(chipPlatform: String, partition: PartitionEntry, partitions: List<PartitionEntry>, autoNvBackup: Boolean = true, autoReboot: Boolean = true): Result<Boolean> = withContext(Dispatchers.IO) {
-        if (partition.isProtectedNv) return@withContext Result.failure(IllegalArgumentException("Cannot format NVRAM."))
-        return@withContext formatPartition(partition, autoReboot, chipPlatform)
-    }
-
     suspend fun dumpAllPartitions(chipPlatform: String = "MT6765", partitions: List<PartitionEntry>): Result<List<String>> = withContext(Dispatchers.IO) {
         if (!ensureDaReady()) return@withContext Result.failure(IllegalStateException("DA not ready."))
         val sessionFolder = "${chipPlatform}_FullDump_${folderDateFormat.format(Date())}"
@@ -594,7 +599,7 @@ class MtkBromProtocolEngine(
         val isReady = ensureTargetConnected()
         if (!isReady || !targetPhoneUsb.isConnected()) return@withContext Result.failure(IllegalStateException("Handshake failed."))
         val chipInfo = readDetailedDeviceInfo().getOrNull()
-        return@withContext securityEngine.executeBypass(chipInfo, false)
+        return@withContext securityEngine.executeBypass(context, chipInfo, false)
     }
 
     suspend fun runMemoryTest(): Result<Boolean> = withContext(Dispatchers.IO) {
@@ -654,19 +659,6 @@ class MtkBromProtocolEngine(
             "0x0717" -> "MT6761/MT6762 (Helio A22/P22)"
             "0x6580" -> "MT6580 (Legacy 32-bit)"
             else -> "MediaTek SoC"
-        }
-    }
-
-    private fun resolveGuessedDevice(hwCode: String): String {
-        return when (hwCode.lowercase()) {
-            "0x0766" -> "Xiaomi Redmi 9A / 9C / Poco C31 / Oppo A15 / Vivo Y12s"
-            "0x0707" -> "Xiaomi Redmi 9 / Note 9 / Realme Narzo 30A / Infinix Note 10"
-            "0x0813", "0x0816" -> "Xiaomi Redmi Note 8 Pro / Realme 6 / Realme 7 / Narzo 20 Pro"
-            "0x0989" -> "Xiaomi Redmi Note 10 5G / Poco M3 Pro 5G / Realme 8 5G"
-            "0x0959" -> "Oppo Reno 6 5G / Realme 9 5G / Vivo V21 / Infinix Zero Ultra"
-            "0x0950" -> "Xiaomi 11T / Poco F3 GT / Realme GT Neo / Vivo V23 Pro"
-            "0x0717" -> "Xiaomi Redmi 6A / Redmi 6 / Infinix Smart 5 / Hot 8"
-            else -> "Universal MediaTek Android Device"
         }
     }
 }
