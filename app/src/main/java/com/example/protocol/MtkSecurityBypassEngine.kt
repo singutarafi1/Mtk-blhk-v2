@@ -43,47 +43,48 @@ class MtkSecurityBypassEngine(
             ?: MtkChipConfigDatabase.findConfig(0x0766)!!
 
         log("Target Platform: ${chipConfig.name} (${chipConfig.description}) [HWCode: 0x%04X]".format(chipConfig.hwCode), LogLevel.INFO)
-        log("CQDMA Base: 0x%08X | Watchdog: 0x%08X".format(chipConfig.cqdmaBase ?: 0L, chipConfig.watchdog), LogLevel.INFO)
-
+        
         try {
             val payloadFileName = when (chipConfig.hwCode) {
                 0x0766 -> "payloads/mt6765_payload.bin"
                 0x0989 -> "payloads/mt6833_payload.bin"
-                else -> null
+                else -> "payloads/mt${chipConfig.hwCode.toString(16)}_payload.bin"
             }
 
             var payloadBytes: ByteArray? = null
-            if (payloadFileName != null) {
-                try {
-                    payloadBytes = context.assets.open(payloadFileName).use { it.readBytes() }
-                    log("Loaded exploit payload: $payloadFileName (${payloadBytes.size} bytes)", LogLevel.INFO)
-                } catch (e: Exception) {
-                    log("[-] Payload file $payloadFileName not found in assets!", LogLevel.WARNING)
-                }
+            try {
+                payloadBytes = context.assets.open(payloadFileName).use { it.readBytes() }
+                log("Loaded exploit payload: $payloadFileName (${payloadBytes.size} bytes)", LogLevel.INFO)
+            } catch (e: Exception) {
+                log("[-] Payload file $payloadFileName not found in assets!", LogLevel.WARNING)
             }
 
-            // [FIX]: Write Payload as a single continuous memory block (Bulk Write)
+            // [FIX]: Payload ကို CMD_WRITE32 သုံးရင် SLA မှ ပိတ်သောကြောင့်
+            // MtkDaUploader (CMD_SEND_DA) ကိုသုံး၍ SRAM သို့ ပို့ပါမည်။
             if (payloadBytes != null && payloadBytes.isNotEmpty()) {
-                log("Uploading Payload to SRAM 0x%08X...".format(chipConfig.bromPayloadAddr), LogLevel.INFO)
+                log("Uploading Payload to SRAM 0x%08X via DA Uploader...".format(chipConfig.bromPayloadAddr), LogLevel.INFO)
                 
-                val paddedSize = if (payloadBytes.size % 4 != 0) payloadBytes.size + (4 - (payloadBytes.size % 4)) else payloadBytes.size
-                val buffer = ByteBuffer.allocate(paddedSize).order(ByteOrder.LITTLE_ENDIAN)
-                buffer.put(payloadBytes)
-                
-                usb.flush(50) // Clean pipe before sending BROM commands
-                
-                val successUpload = writeMemoryBlock(chipConfig.bromPayloadAddr, buffer.array())
-                
-                if (successUpload) {
+                val uploadResult = MtkDaUploader.sendDa(
+                    usb = usb,
+                    daAddress = chipConfig.bromPayloadAddr,
+                    daData = payloadBytes,
+                    sigLen = 0,
+                    maxPacketSize = 0x400,
+                    logCallback = logCallback,
+                    onProgress = {}
+                )
+
+                if (uploadResult.isSuccess) {
                     log("[+] Payload successfully staged in SRAM.", LogLevel.SUCCESS)
                 } else {
-                    log("[-] Failed to write payload to SRAM.", LogLevel.ERROR)
+                    log("[-] Failed to upload payload to SRAM: ${uploadResult.exceptionOrNull()?.message}", LogLevel.ERROR)
                     return@withContext Result.failure(IllegalStateException("Payload upload failed"))
                 }
             } else {
-                log("[-] No payload injected! Bypass may fail with 0x1D0D.", LogLevel.WARNING)
+                log("[-] No payload injected! Bypass may fail.", LogLevel.WARNING)
             }
 
+            // STEP 2: Deploy Kamakiri2 Line Coding Exploit
             log("[1/2] Configuring USB Exploit Interface (Kamakiri2)...", LogLevel.INFO)
             val kamakiri = MtkKamakiriExploit(usb) { msg, lvl -> log(msg, lvl) }
             val exploitSuccess = kamakiri.exploitKamakiri2(chipConfig.bromPayloadAddr)
@@ -99,6 +100,7 @@ class MtkSecurityBypassEngine(
             usb.flush(50)
             delay(50)
 
+            // STEP 3: Disable BootROM Blacklist via CQDMA Controller
             log("[2/2] Overriding BootROM Range Blacklist via CQDMA...", LogLevel.INFO)
             val cqdma = MtkCqdmaEngine(
                 read32Func = { addr -> readRegister32(addr) },
@@ -124,9 +126,6 @@ class MtkSecurityBypassEngine(
         }
     }
 
-    /**
-     * Safe Echo Bytes that correctly handles Android USB fragmentation
-     */
     private fun echoBytes(data: ByteArray, timeoutMs: Int = 1000): Boolean {
         if (usb.writeRaw(data, timeoutMs) != data.size) return false
         val echo = ByteArray(data.size)
@@ -157,34 +156,6 @@ class MtkSecurityBypassEngine(
         }
         if (totalRead < 2) return null
         return ((buf[0].toInt() and 0xFF) shl 8) or (buf[1].toInt() and 0xFF)
-    }
-
-    /**
-     * Fast multi-word memory writer for uploading payloads efficiently
-     */
-    private fun writeMemoryBlock(addr: Long, data: ByteArray): Boolean {
-        val dwords = data.size / 4
-        val buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
-
-        if (!echoBytes(byteArrayOf(CMD_WRITE32), 1500)) return false
-
-        val addrBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt((addr and 0xFFFFFFFFL).toInt()).array()
-        if (!echoBytes(addrBytes, 1500)) return false
-
-        val countBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(dwords).array()
-        if (!echoBytes(countBytes, 1500)) return false
-
-        val status = readStatusWord(1500) ?: return false
-        if (status > 0xFF) return false
-
-        for (i in 0 until dwords) {
-            val value = buffer.int
-            val valBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(value).array()
-            if (!echoBytes(valBytes, 1500)) return false
-        }
-
-        val status2 = readStatusWord(1500) ?: return false
-        return status2 <= 0xFF
     }
 
     private fun readRegister32(addr: Long): Long {
