@@ -5,7 +5,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * CQDMA Exploit and Direct Memory Access Controller ported from mtkclient cqdma.py
+ * CQDMA Exploit and Direct Memory Access Controller
  */
 class MtkCqdmaEngine(
     private val read32Func: (Long) -> Long,
@@ -40,16 +40,12 @@ class MtkCqdmaEngine(
             var retry = 0
             while (retry < 50) {
                 val enVal = read32Func(cqdmaBase + CQDMA_EN)
-                if ((enVal and 1L) == 0L) {
-                    break
-                }
+                if ((enVal and 1L) == 0L) break
                 retry++
             }
-
             val readVal = read32Func(apDmaMem)
             buffer.putInt(readVal.toInt())
         }
-
         return outBytes
     }
 
@@ -65,9 +61,7 @@ class MtkCqdmaEngine(
             var retry = 0
             while (retry < 50) {
                 val enVal = read32Func(cqdmaBase + CQDMA_EN)
-                if ((enVal and 1L) == 0L) {
-                    break
-                }
+                if ((enVal and 1L) == 0L) break
                 retry++
             }
             write32Func(apDmaMem, 0xCAFEBABE)
@@ -97,7 +91,13 @@ class MtkCqdmaEngine(
             }
         }
 
-        // [FIX ADDED]: CQDMA Controller မှတဆင့် Hardware Watchdog Timer (WDT) ကို အသေအချာ ပိတ်ပါမည်။
+        // [FIX]: Force Disable SLA/DAA via CQDMA (No payload required)
+        if (config.hwCode == 0x0766) {
+            logCallback("Patching SEC_SLA/SBC registers for MT6765 via CQDMA to bypass 0x1D0D...", LogLevel.INFO)
+            // MT6765 SecReg is located at 0x102A8C based on PC Tool output
+            cqwrite32(cqdmaBase, apDmaMem, 0x102A8CL, longArrayOf(0x00000000L)) 
+        }
+
         logCallback("Disabling Hardware Watchdog Timer via CQDMA to prevent reboot...", LogLevel.INFO)
         val wdtSuccess = cqwrite32(cqdmaBase, apDmaMem, config.watchdog, longArrayOf(0x22000000L))
         if (wdtSuccess) {
