@@ -26,9 +26,6 @@ class MtkCqdmaEngine(
         const val CQDMA_DST2 = 0x64L
     }
 
-    /**
-     * Reads memory via CQDMA DMA controller
-     */
     fun cqread32(cqdmaBase: Long, apDmaMem: Long, addr: Long, dwords: Int): ByteArray {
         val outBytes = ByteArray(dwords * 4)
         val buffer = ByteBuffer.wrap(outBytes).order(ByteOrder.LITTLE_ENDIAN)
@@ -40,7 +37,6 @@ class MtkCqdmaEngine(
             write32Func(cqdmaBase + CQDMA_LEN1, 4L)
             write32Func(cqdmaBase + CQDMA_EN, 1L)
 
-            // Polling until CQDMA_EN & 1 == 0
             var retry = 0
             while (retry < 50) {
                 val enVal = read32Func(cqdmaBase + CQDMA_EN)
@@ -57,9 +53,6 @@ class MtkCqdmaEngine(
         return outBytes
     }
 
-    /**
-     * Writes memory via CQDMA DMA controller
-     */
     fun cqwrite32(cqdmaBase: Long, apDmaMem: Long, addr: Long, values: LongArray): Boolean {
         for (i in values.indices) {
             val targetVal = values[i]
@@ -77,15 +70,11 @@ class MtkCqdmaEngine(
                 }
                 retry++
             }
-
             write32Func(apDmaMem, 0xCAFEBABE)
         }
         return true
     }
 
-    /**
-     * Disables BootROM memory access security blacklist entries using CQDMA DMA registers
-     */
     fun disableRangeBlacklist(config: ChipConfig): Boolean {
         val cqdmaBase = config.cqdmaBase
         val apDmaMem = config.apDmaMem
@@ -96,19 +85,25 @@ class MtkCqdmaEngine(
             return true
         }
 
-        if (blacklist.isEmpty()) {
-            logCallback("No security blacklist entries specified for ${config.name}.", LogLevel.INFO)
-            return true
+        if (blacklist.isNotEmpty()) {
+            logCallback("Disabling BootROM range security checks (${blacklist.size} entries)...", LogLevel.INFO)
+            for ((idx, entry) in blacklist.withIndex()) {
+                logCallback(" -> Patching blacklist entry #$idx at 0x%08X with 0x%08X...".format(entry.address, entry.value), LogLevel.INFO)
+                val success = cqwrite32(cqdmaBase, apDmaMem, entry.address, longArrayOf(entry.value))
+                if (!success) {
+                    logCallback("[-] Failed to patch security register at 0x%08X".format(entry.address), LogLevel.WARNING)
+                    return false
+                }
+            }
         }
 
-        logCallback("Disabling BootROM range security checks (${blacklist.size} entries)...", LogLevel.INFO)
-        for ((idx, entry) in blacklist.withIndex()) {
-            logCallback(" -> Patching blacklist entry #$idx at 0x%08X with 0x%08X...".format(entry.address, entry.value), LogLevel.INFO)
-            val success = cqwrite32(cqdmaBase, apDmaMem, entry.address, longArrayOf(entry.value))
-            if (!success) {
-                logCallback("[-] Failed to patch security register at 0x%08X".format(entry.address), LogLevel.WARNING)
-                return false
-            }
+        // [FIX ADDED]: CQDMA Controller မှတဆင့် Hardware Watchdog Timer (WDT) ကို အသေအချာ ပိတ်ပါမည်။
+        logCallback("Disabling Hardware Watchdog Timer via CQDMA to prevent reboot...", LogLevel.INFO)
+        val wdtSuccess = cqwrite32(cqdmaBase, apDmaMem, config.watchdog, longArrayOf(0x22000000L))
+        if (wdtSuccess) {
+            logCallback("[+] Watchdog Timer successfully disabled via CQDMA.", LogLevel.SUCCESS)
+        } else {
+            logCallback("[-] Warning: Failed to disable WDT via CQDMA.", LogLevel.WARNING)
         }
 
         logCallback("[+] BootROM Security Blacklist successfully disabled! SLA/DAA Protection unlocked.", LogLevel.SUCCESS)
