@@ -23,7 +23,12 @@ class MtkSecurityBypassEngine(
 ) {
 
     companion object {
-        const val CMD_READ32: Byte = 0xD6.toByte()
+        // NOTE: 0xD6 is JUMP_BL in the real BROM command table, NOT READ32.
+        // The real READ32 opcode is 0xD1. Using 0xD6 here caused every
+        // register read during blacklist patching to send BROM a JUMP_BL
+        // command instead, desyncing the USB command/response stream and
+        // producing the downstream "CMD_SEND_DA (0xD7 echo mismatch)" error.
+        const val CMD_READ32: Byte = 0xD1.toByte()
         const val CMD_WRITE32: Byte = 0xD4.toByte()
     }
 
@@ -100,38 +105,77 @@ class MtkSecurityBypassEngine(
         }
     }
 
-    private fun readRegister32(addr: Long): Long {
-        val cmdBuf = ByteBuffer.allocate(9).order(ByteOrder.BIG_ENDIAN)
-        cmdBuf.put(CMD_READ32)
-        cmdBuf.putInt((addr and 0xFFFFFFFFL).toInt())
-        cmdBuf.putInt(1)
-
-        if (usb.writeRaw(cmdBuf.array(), 300) <= 0) return 0L
-        val ack = ByteArray(2)
-        if (usb.readRaw(ack, 300) < 2) return 0L
-
-        val rx = ByteArray(4)
-        val read = usb.readRaw(rx, 300)
-        return if (read >= 4) {
-            ByteBuffer.wrap(rx).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xFFFFFFFFL
-        } else 0L
+    /**
+     * Writes [data] then reads back the same number of bytes, verifying the
+     * device echoed them exactly. Mirrors mtkclient's Preloader.echo():
+     * every field of a BROM command must be echo-verified individually
+     * before the next field is sent, or the response stream desyncs.
+     */
+    private fun echoBytes(data: ByteArray, timeoutMs: Int = 300): Boolean {
+        if (usb.writeRaw(data, timeoutMs) != data.size) return false
+        val echo = ByteArray(data.size)
+        val read = usb.readRaw(echo, timeoutMs)
+        return read == data.size && echo.contentEquals(data)
     }
 
+    private fun readStatusWord(timeoutMs: Int = 300): Int? {
+        val status = ByteArray(2)
+        if (usb.readRaw(status, timeoutMs) != 2) return null
+        return ((status[0].toInt() and 0xFF) shl 8) or (status[1].toInt() and 0xFF)
+    }
+
+    /**
+     * BROM register read (READ32, opcode 0xD1). Ported field-for-field from
+     * mtkclient's Preloader.read(addr, dwords=1, length=32):
+     *   echo(cmd) -> echo(addr) -> echo(count) -> status -> data -> status2
+     */
+    private fun readRegister32(addr: Long): Long {
+        if (!echoBytes(byteArrayOf(CMD_READ32))) return 0L
+
+        val addrBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+            .putInt((addr and 0xFFFFFFFFL).toInt()).array()
+        if (!echoBytes(addrBytes)) return 0L
+
+        val countBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(1).array()
+        if (!echoBytes(countBytes)) return 0L
+
+        val status = readStatusWord() ?: return 0L
+        if (status > 0xFF) return 0L
+
+        // Register value is returned big-endian (Preloader.rdword default: little=False)
+        val rx = ByteArray(4)
+        if (usb.readRaw(rx, 300) != 4) return 0L
+        val value = (ByteBuffer.wrap(rx).order(ByteOrder.BIG_ENDIAN).int.toLong()) and 0xFFFFFFFFL
+
+        val status2 = readStatusWord() ?: return 0L
+        if (status2 > 0xFF) return 0L
+
+        return value
+    }
+
+    /**
+     * BROM register write (WRITE32, opcode 0xD4). Ported field-for-field
+     * from mtkclient's Preloader.write(addr, values, length=32):
+     *   echo(cmd) -> echo(addr) -> echo(count) -> status -> echo(value) -> status2
+     */
     private fun writeRegister32(addr: Long, value: Long): Boolean {
-        val cmdBuf = ByteBuffer.allocate(9).order(ByteOrder.BIG_ENDIAN)
-        cmdBuf.put(CMD_WRITE32)
-        cmdBuf.putInt((addr and 0xFFFFFFFFL).toInt())
-        cmdBuf.putInt(1)
+        if (!echoBytes(byteArrayOf(CMD_WRITE32))) return false
 
-        if (usb.writeRaw(cmdBuf.array(), 300) <= 0) return false
-        val ack = ByteArray(2)
-        usb.readRaw(ack, 300)
+        val addrBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+            .putInt((addr and 0xFFFFFFFFL).toInt()).array()
+        if (!echoBytes(addrBytes)) return false
 
-        val valBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt((value and 0xFFFFFFFFL).toInt()).array()
-        if (usb.writeRaw(valBuf, 300) <= 0) return false
+        val countBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(1).array()
+        if (!echoBytes(countBytes)) return false
 
-        val postAck = ByteArray(2)
-        usb.readRaw(postAck, 300)
-        return true
+        val status = readStatusWord() ?: return false
+        if (status > 0xFF) return false
+
+        val valBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+            .putInt((value and 0xFFFFFFFFL).toInt()).array()
+        if (!echoBytes(valBytes)) return false
+
+        val status2 = readStatusWord() ?: return false
+        return status2 <= 0xFF
     }
 }
