@@ -23,11 +23,6 @@ class MtkSecurityBypassEngine(
 ) {
 
     companion object {
-        // NOTE: 0xD6 is JUMP_BL in the real BROM command table, NOT READ32.
-        // The real READ32 opcode is 0xD1. Using 0xD6 here caused every
-        // register read during blacklist patching to send BROM a JUMP_BL
-        // command instead, desyncing the USB command/response stream and
-        // producing the downstream "CMD_SEND_DA (0xD7 echo mismatch)" error.
         const val CMD_READ32: Byte = 0xD1.toByte()
         const val CMD_WRITE32: Byte = 0xD4.toByte()
     }
@@ -72,7 +67,7 @@ class MtkSecurityBypassEngine(
             }
 
             delay(100)
-            usb.flush(50)
+            // [ANDROID FIX]: Removed usb.flush(50) here to prevent STALL
 
             // STEP 2: Disable BootROM Blacklist via CQDMA Controller
             log("[2/2] Overriding BootROM Range Blacklist via CQDMA...", LogLevel.INFO)
@@ -88,11 +83,16 @@ class MtkSecurityBypassEngine(
             } else {
                 log("[+] BootROM Security Blacklist successfully disabled! SLA/DAA Protection unlocked.", LogLevel.SUCCESS)
                 log("[+] CQDMA Blacklist successfully unlocked. Direct DA loading active.", LogLevel.SUCCESS)
+                
+                // [FIX ADDED]: MTK Watchdog Timer ကို ပိတ်ရပါမည် (WDT Disable)
+                log("Disabling Hardware Watchdog Timer to prevent reboot...", LogLevel.INFO)
+                val wdtDisabled = writeRegister32(chipConfig.watchdog, 0x22000000L)
+                if (wdtDisabled) {
+                    log("[+] Watchdog Timer (WDT) successfully disabled.", LogLevel.SUCCESS)
+                }
             }
 
-            // Flush USB Pipe thoroughly after CQDMA register transactions
-            usb.flush(50)
-            delay(150)
+            // [ANDROID FIX]: Removed usb.flush(50) and delay(150) here completely to avoid Timeout STALLs
 
             log("==================================================", LogLevel.SUCCESS)
             log("SECURITY BYPASS COMPLETED: BootROM Ready for DA Stage 1.", LogLevel.SUCCESS)
