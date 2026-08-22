@@ -20,49 +20,30 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
 
 enum class UsbDeviceMode(val label: String, val description: String) {
-    BROM("MTK BROM", "MediaTek BootROM Mode (Flash & Service Ready)"),
+    BROM("MTK BROM", "MediaTek BootROM Mode"),
     PRELOADER("Preloader", "MTK Preloader / DA VCOM Port"),
-    FASTBOOT("Fastboot", "Android Fastboot Bootloader Mode"),
-    ADB("ADB Debugging", "Android USB Debugging Interface"),
-    MTP("MTP / File Transfer", "Media Transfer Protocol (Normal Android Boot)"),
-    CDC_SERIAL("CDC Serial", "Serial / UART Bridge Device"),
+    FASTBOOT("Fastboot", "Android Fastboot Mode"),
+    ADB("ADB Debugging", "Android USB Debugging"),
+    MTP("MTP / Media", "Media Transfer Protocol"),
+    CDC_SERIAL("CDC Serial", "Serial / UART Bridge"),
     UNKNOWN("USB Device", "Connected USB Peripheral"),
     NONE("Unplugged", "No USB Device Connected")
 }
 
 sealed class TargetPhoneState {
     object Disconnected : TargetPhoneState()
-    data class RequestingPermission(
-        val deviceName: String,
-        val mode: UsbDeviceMode,
-        val vidPid: String
-    ) : TargetPhoneState()
-    data class Connected(
-        val deviceName: String,
-        val mode: UsbDeviceMode,
-        val isBromMode: Boolean,
-        val vidPid: String,
-        val fileDescriptor: Int = -1
-    ) : TargetPhoneState()
+    data class RequestingPermission(val deviceName: String, val mode: UsbDeviceMode, val vidPid: String) : TargetPhoneState()
+    data class Connected(val deviceName: String, val mode: UsbDeviceMode, val isBromMode: Boolean, val vidPid: String, val fileDescriptor: Int = -1) : TargetPhoneState()
     data class Error(val message: String) : TargetPhoneState()
 }
 
-/**
- * Native Android USB Host Driver for MediaTek Protocol
- * Faithful port of Python mtkclient port.py & mtk.py
- * Contains Race-Condition Mutex Lock & Watchdog Killer
- */
-class TargetPhoneUsbManager(
-    private val context: Context
-) {
+class TargetPhoneUsbManager(private val context: Context) {
+
     companion object {
         const val ACTION_USB_PHONE_PERMISSION = "com.example.mtkbridge.USB_PHONE_PERMISSION"
-        
         const val MTK_VID = 0x0E8D
         const val MTK_PID_BROM = 0x0003
         const val MTK_PID_BOOTROM_GENERIC = 0x0001
@@ -73,24 +54,19 @@ class TargetPhoneUsbManager(
         const val MTK_PID_CDC = 0x2004
         const val MTK_PID_DEBUG = 0x2005
 
-        val SUPPORTED_VIDS = setOf(
-            0x0E8D, 0x1004, 0x0BB4, 0x2A45, 0x1782,
-            0x1A86, 0x10C4, 0x0403, 0x18D1, 0x2717
-        )
+        val SUPPORTED_VIDS = setOf(0x0E8D, 0x1004, 0x0BB4, 0x2A45, 0x1782, 0x1A86, 0x10C4, 0x0403, 0x18D1, 0x2717)
     }
 
     val usbManager: UsbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
-    
     private var usbConnection: UsbDeviceConnection? = null
     private var usbInterface: UsbInterface? = null
     private var inEndpoint: UsbEndpoint? = null
     private var outEndpoint: UsbEndpoint? = null
-    
+
     var currentDevice: UsbDevice? = null
         private set
-        
-    private val scope = CoroutineScope(Dispatchers.IO)
 
+    private val scope = CoroutineScope(Dispatchers.IO)
     var onDeviceAutoConnectedListener: ((TargetPhoneState.Connected) -> Unit)? = null
 
     @Volatile
@@ -99,9 +75,8 @@ class TargetPhoneUsbManager(
     private val _phoneState = MutableStateFlow<TargetPhoneState>(TargetPhoneState.Disconnected)
     val phoneState: StateFlow<TargetPhoneState> = _phoneState.asStateFlow()
 
-    // Concurrency / Race-condition Guards
-    private val isPermissionRequested = AtomicBoolean(false)
     private val isConnecting = AtomicBoolean(false)
+    private val isPermissionRequested = AtomicBoolean(false)
     private var lastPermissionRequestTimestamp = 0L
     private var requestedDeviceKey: String? = null
 
@@ -112,7 +87,6 @@ class TargetPhoneUsbManager(
                 ACTION_USB_PHONE_PERMISSION -> {
                     isPermissionRequested.set(false)
                     requestedDeviceKey = null
-
                     val device: UsbDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
                     } else {
@@ -124,7 +98,7 @@ class TargetPhoneUsbManager(
                         if (strictBromOnlyMode && !isBromDevice(device)) return
                         scope.launch { connectDevice(device) }
                     } else {
-                        _phoneState.value = TargetPhoneState.Error("USB Permission denied by user.")
+                        _phoneState.value = TargetPhoneState.Error("USB Permission denied.")
                     }
                 }
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
@@ -174,38 +148,14 @@ class TargetPhoneUsbManager(
         if (isBromDevice(device)) return UsbDeviceMode.BROM
         val vid = device.vendorId
         val pid = device.productId
-        
         if (vid == MTK_VID && (pid == MTK_PID_PRELOADER || pid == MTK_PID_PRELOADER_2 || pid == MTK_PID_CDC || pid == MTK_PID_DEBUG)) {
             return UsbDeviceMode.PRELOADER
         }
-
-        var hasFastboot = false
-        var hasAdb = false
-        var hasMtp = false
-        var hasCdc = false
-
-        for (i in 0 until device.interfaceCount) {
-            val iface = device.getInterface(i)
-            if (iface.interfaceClass == UsbConstants.USB_CLASS_VENDOR_SPEC && iface.interfaceSubclass == 0x42) {
-                if (iface.interfaceProtocol == 0x03) hasFastboot = true
-                if (iface.interfaceProtocol == 0x01) hasAdb = true
-            }
-            if (iface.interfaceClass == UsbConstants.USB_CLASS_STILL_IMAGE) hasMtp = true
-            if (iface.interfaceClass == UsbConstants.USB_CLASS_CDC_DATA || iface.interfaceClass == UsbConstants.USB_CLASS_COMM) hasCdc = true
-        }
-
-        if (hasFastboot) return UsbDeviceMode.FASTBOOT
-        if (hasAdb) return UsbDeviceMode.ADB
-        if (vid == MTK_VID) return UsbDeviceMode.PRELOADER
-        if (hasCdc || vid == 0x1A86 || vid == 0x10C4 || vid == 0x0403) return UsbDeviceMode.CDC_SERIAL
-        if (hasMtp) return UsbDeviceMode.MTP
         return UsbDeviceMode.UNKNOWN
     }
 
     fun isMediaTekDevice(device: UsbDevice): Boolean = device.vendorId in SUPPORTED_VIDS
-
     fun getAttachedDevices(): List<UsbDevice> = usbManager.deviceList.values.toList()
-
     fun isBromConnected(): Boolean = currentDevice?.let { isBromDevice(it) } ?: false
 
     fun requestDevicePermission(device: UsbDevice) {
@@ -257,7 +207,6 @@ class TargetPhoneUsbManager(
 
         val targetDevice = deviceList.values.firstOrNull { it.vendorId == MTK_VID }
             ?: deviceList.values.firstOrNull { isMediaTekDevice(it) }
-            ?: deviceList.values.firstOrNull()
             ?: return@withContext false
 
         if (!usbManager.hasPermission(targetDevice)) {
@@ -267,22 +216,13 @@ class TargetPhoneUsbManager(
         return@withContext connectDevice(targetDevice)
     }
 
-    /**
-     * Connects to USB device with Re-entrancy Lock (Prevents double FD open race conditions).
-     */
     suspend fun connectDevice(targetDevice: UsbDevice): Boolean = withContext(Dispatchers.IO) {
-        if (isConnecting.getAndSet(true)) {
-            return@withContext true
-        }
-
+        if (isConnecting.getAndSet(true)) return@withContext true
         try {
-            // Check if already actively claimed and connected
-            if (usbConnection != null && currentDevice?.deviceId == targetDevice.deviceId) {
-                return@withContext true
-            }
+            if (usbConnection != null && currentDevice?.deviceId == targetDevice.deviceId) return@withContext true
 
             val connection = usbManager.openDevice(targetDevice) ?: run {
-                _phoneState.value = TargetPhoneState.Error("Failed to open USB Device port.")
+                _phoneState.value = TargetPhoneState.Error("Failed to open USB Device.")
                 return@withContext false
             }
 
@@ -310,19 +250,9 @@ class TargetPhoneUsbManager(
 
             if (claimedIface == null || bulkIn == null || bulkOut == null) {
                 connection.close()
-                val mode = detectDeviceMode(targetDevice)
-                val vidPidStr = String.format("0x%04X:0x%04X", targetDevice.vendorId, targetDevice.productId)
-                _phoneState.value = TargetPhoneState.Connected(
-                    deviceName = targetDevice.productName ?: "USB Device",
-                    mode = mode,
-                    isBromMode = (mode == UsbDeviceMode.BROM),
-                    vidPid = "$vidPidStr [${mode.label}]",
-                    fileDescriptor = -1
-                )
-                return@withContext true
+                return@withContext false
             }
 
-            // Release previous if open
             usbInterface?.let { usbConnection?.releaseInterface(it) }
             usbConnection?.close()
 
@@ -336,23 +266,46 @@ class TargetPhoneUsbManager(
             val mode = detectDeviceMode(targetDevice)
             val isBrom = (mode == UsbDeviceMode.BROM)
             val vidPidStr = String.format("0x%04X:0x%04X", targetDevice.vendorId, targetDevice.productId)
-            val rawFd = connection.fileDescriptor
 
             val state = TargetPhoneState.Connected(
                 deviceName = targetDevice.productName ?: "MediaTek Device",
                 mode = mode,
                 isBromMode = isBrom,
                 vidPid = "$vidPidStr [${mode.label}]",
-                fileDescriptor = rawFd
+                fileDescriptor = connection.fileDescriptor
             )
             _phoneState.value = state
             onDeviceAutoConnectedListener?.invoke(state)
             return@withContext true
         } catch (e: Exception) {
-            _phoneState.value = TargetPhoneState.Error("USB Open Exception: ${e.message}")
+            _phoneState.value = TargetPhoneState.Error("USB Exception: ${e.message}")
             return@withContext false
         } finally {
             isConnecting.set(false)
+        }
+    }
+
+    /**
+     * Resets USB Endpoint Halt (STALL) condition created by Kamakiri exploit.
+     * Replicates Python libusb_clear_halt() via Standard USB CLEAR_FEATURE request.
+     */
+    fun clearEndpointHalt(): Boolean {
+        val conn = usbConnection ?: return false
+        val inEp = inEndpoint ?: return false
+        val outEp = outEndpoint ?: return false
+
+        try {
+            // Standard USB CLEAR_FEATURE (0x01), ENDPOINT_HALT (0x00), Target: Endpoint Address
+            conn.controlTransfer(0x02, 0x01, 0x0000, outEp.address, null, 0, 500)
+            conn.controlTransfer(0x02, 0x01, 0x0000, inEp.address, null, 0, 500)
+
+            usbInterface?.let {
+                conn.releaseInterface(it)
+                conn.claimInterface(it, true)
+            }
+            return true
+        } catch (_: Exception) {
+            return false
         }
     }
 
@@ -368,16 +321,12 @@ class TargetPhoneUsbManager(
         return totalFlushed
     }
 
-    /**
-     * BROM Handshake Sync: 0xA0->0x5F, 0x0A->0xF5, 0x50->0xAF, 0x05->0xFA
-     */
     suspend fun blastBromHandshakeSync(maxAttempts: Int = 60): Boolean = withContext(Dispatchers.IO) {
         val conn = usbConnection ?: return@withContext false
         val outEp = outEndpoint ?: return@withContext false
         val inEp = inEndpoint ?: return@withContext false
 
         flush(20)
-
         val rxBuf = ByteArray(1)
         val sendA0 = byteArrayOf(0xA0.toByte())
         var syncedA0 = false
