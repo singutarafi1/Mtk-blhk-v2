@@ -100,9 +100,8 @@ object MtkDaUploader {
 
         logCallback(TerminalLog("", "[DA UPLOADER] Sending DA Stage to 0x%08X (Size: %d bytes, Sig: %d)".format(daAddress, payload.size, sigLen), LogLevel.INFO))
 
-        // [ANDROID FIX]: DO NOT call clearEndpointHalt() here, it desyncs the DATA0/DATA1 toggle.
-        usb.flush(50)
-        delay(50)
+        // [ANDROID FIX]: Removed flush() and delay() here. 
+        // Previously: usb.flush(50); delay(50) -> This caused Timeout STALL.
 
         // 1. Send CMD_SEND_DA (0xD7), echo-verified 
         // [ANDROID FIX]: Removed Retry Loop to prevent overlapping BROM states.
