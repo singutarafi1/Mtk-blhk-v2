@@ -23,26 +23,15 @@ class MtkSecurityBypassEngine(
 ) {
 
     companion object {
-        // NOTE: 0xD6 is JUMP_BL in the real BROM command table, NOT READ32.
-        // The real READ32 opcode is 0xD1. Using 0xD6 here caused every
-        // register read during blacklist patching to send BROM a JUMP_BL
-        // command instead, desyncing the USB command/response stream and
-        // producing the downstream "CMD_SEND_DA (0xD7 echo mismatch)" error.
-        const val CMD_READ32: Byte = 0xD1.toByte()
-        const val CMD_WRITE32: Byte = 0xD4.toByte()
+        // မှန်တဲ့ opcode တွေ
+        const val CMD_READ32: Byte = 0xD1.toByte()   // READ32 opcode
+        const val CMD_WRITE32: Byte = 0xD4.toByte()  // WRITE32 opcode
     }
 
     private fun log(message: String, level: LogLevel = LogLevel.INFO) {
         logCallback(TerminalLog("", message, level))
     }
 
-    /**
-     * Executes MediaTek Security Bypass:
-     * Mode 1 (MT6765, MT6768, MT6833, etc.):
-     * 1. Kamakiri2 USB Line Coding Exploit
-     * 2. CQDMA Blacklist Security Registers Override (Patch to 0x00000000)
-     * 3. Flush USB Pipe & Unlock BootROM (No SRAM payload jump required).
-     */
     suspend fun executeBypass(
         context: Context,
         deviceInfo: MtkChipInfo?,
@@ -60,7 +49,7 @@ class MtkSecurityBypassEngine(
         log("CQDMA Base: 0x%08X | Watchdog: 0x%08X".format(chipConfig.cqdmaBase ?: 0L, chipConfig.watchdog), LogLevel.INFO)
 
         try {
-            // STEP 1: Deploy Kamakiri2 Line Coding Exploit
+            // STEP 1: Kamakiri2 exploit
             log("[1/2] Configuring USB Exploit Interface (Kamakiri2)...", LogLevel.INFO)
             val kamakiri = MtkKamakiriExploit(usb) { msg, lvl -> log(msg, lvl) }
             val exploitSuccess = kamakiri.exploitKamakiri2(chipConfig.bromPayloadAddr)
@@ -74,7 +63,7 @@ class MtkSecurityBypassEngine(
             delay(100)
             usb.flush(50)
 
-            // STEP 2: Disable BootROM Blacklist via CQDMA Controller
+            // STEP 2: Disable BootROM Blacklist via CQDMA
             log("[2/2] Overriding BootROM Range Blacklist via CQDMA...", LogLevel.INFO)
             val cqdma = MtkCqdmaEngine(
                 read32Func = { addr -> readRegister32(addr) },
@@ -90,7 +79,6 @@ class MtkSecurityBypassEngine(
                 log("[+] CQDMA Blacklist successfully unlocked. Direct DA loading active.", LogLevel.SUCCESS)
             }
 
-            // Flush USB Pipe thoroughly after CQDMA register transactions
             usb.flush(50)
             delay(150)
 
@@ -105,12 +93,6 @@ class MtkSecurityBypassEngine(
         }
     }
 
-    /**
-     * Writes [data] then reads back the same number of bytes, verifying the
-     * device echoed them exactly. Mirrors mtkclient's Preloader.echo():
-     * every field of a BROM command must be echo-verified individually
-     * before the next field is sent, or the response stream desyncs.
-     */
     private fun echoBytes(data: ByteArray, timeoutMs: Int = 300): Boolean {
         if (usb.writeRaw(data, timeoutMs) != data.size) return false
         val echo = ByteArray(data.size)
@@ -124,11 +106,6 @@ class MtkSecurityBypassEngine(
         return ((status[0].toInt() and 0xFF) shl 8) or (status[1].toInt() and 0xFF)
     }
 
-    /**
-     * BROM register read (READ32, opcode 0xD1). Ported field-for-field from
-     * mtkclient's Preloader.read(addr, dwords=1, length=32):
-     *   echo(cmd) -> echo(addr) -> echo(count) -> status -> data -> status2
-     */
     private fun readRegister32(addr: Long): Long {
         if (!echoBytes(byteArrayOf(CMD_READ32))) return 0L
 
@@ -142,7 +119,6 @@ class MtkSecurityBypassEngine(
         val status = readStatusWord() ?: return 0L
         if (status > 0xFF) return 0L
 
-        // Register value is returned big-endian (Preloader.rdword default: little=False)
         val rx = ByteArray(4)
         if (usb.readRaw(rx, 300) != 4) return 0L
         val value = (ByteBuffer.wrap(rx).order(ByteOrder.BIG_ENDIAN).int.toLong()) and 0xFFFFFFFFL
@@ -153,11 +129,6 @@ class MtkSecurityBypassEngine(
         return value
     }
 
-    /**
-     * BROM register write (WRITE32, opcode 0xD4). Ported field-for-field
-     * from mtkclient's Preloader.write(addr, values, length=32):
-     *   echo(cmd) -> echo(addr) -> echo(count) -> status -> echo(value) -> status2
-     */
     private fun writeRegister32(addr: Long, value: Long): Boolean {
         if (!echoBytes(byteArrayOf(CMD_WRITE32))) return false
 
