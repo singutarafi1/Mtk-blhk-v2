@@ -170,6 +170,7 @@ object MtkDaUploader {
             return@withContext Result.failure(IllegalStateException("CMD_JUMP_DA echo mismatch."))
         }
 
-        val addrBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt((daAddress and 0xFFFFFFFFL).toInt()).array()
+        val addrBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+            .putInt((daAddress and 0xFFFFFFFFL).toInt()).array()
         if (usb.writeRaw(addrBuf, 1000) != 4) {
-            return@withContext Result.failure(IllegalStateException("Failed writing DA jump address
+            return@withContext Result.failure(IllegalStateException("Failed writing DA
