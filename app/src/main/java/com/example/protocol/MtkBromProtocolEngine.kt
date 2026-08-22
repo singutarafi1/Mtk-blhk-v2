@@ -52,7 +52,6 @@ class MtkBromProtocolEngine(
         const val CMD_WRITE32: Byte = 0xD4.toByte()
         const val CMD_READ32: Byte = 0xD6.toByte()
 
-        // BROM Stage 1 DA Sync ACK
         const val DA_SYNC_ACK: Byte = 0xC0.toByte()
     }
 
@@ -75,32 +74,8 @@ class MtkBromProtocolEngine(
         return (read > 0 && echo[0] == cmd)
     }
 
-    /**
-     * Kills Hardware Watchdog Timer (WDT) to prevent target phone from rebooting during BROM/DA stage.
-     */
-    private suspend fun disableWatchdog(wdtAddress: Long = 0x10007000L): Boolean = withContext(Dispatchers.IO) {
-        val cmdBuf = ByteBuffer.allocate(9).order(ByteOrder.BIG_ENDIAN)
-        cmdBuf.put(CMD_WRITE32)
-        cmdBuf.putInt((wdtAddress and 0xFFFFFFFFL).toInt())
-        cmdBuf.putInt(1) // 1 Dword
+    // [FIX]: USB Pipe ညစ်ညမ်းစေသော အဟောင်း `disableWatchdog()` ကို လုံးဝ ဖယ်ရှားလိုက်ပါပြီ။
 
-        if (targetPhoneUsb.writeRaw(cmdBuf.array(), 500) <= 0) return@withContext false
-
-        val ack = ByteArray(2)
-        targetPhoneUsb.readRaw(ack, 500)
-
-        // MTK WDT Unlock/Disable Key
-        val valBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(0x22000000).array()
-        if (targetPhoneUsb.writeRaw(valBuf, 500) <= 0) return@withContext false
-
-        val postAck = ByteArray(2)
-        targetPhoneUsb.readRaw(postAck, 500)
-        return@withContext true
-    }
-
-    /**
-     * Actively listens and captures the MTK BROM USB Port during device boot-up.
-     */
     private suspend fun ensureTargetConnected(timeoutSec: Int = 30): Boolean = withContext(Dispatchers.IO) {
         if (targetPhoneUsb.isConnected() && targetPhoneUsb.isBromConnected()) return@withContext true
 
@@ -215,11 +190,15 @@ class MtkBromProtocolEngine(
         return data
     }
 
-    /**
-     * Initializes Download Agent (Stage 1 DA_PL & Stage 2 XFLASH) strictly matching Python mtkclient.
-     */
     private suspend fun ensureDaReady(): Boolean = withContext(Dispatchers.IO) {
         if (daLoaded && xflashEngine != null) return@withContext true
+
+        // [FIX ADDED]: DA ဖိုင်များကို Storage မှ ဖတ်ယူချိန် ၅ စက္ကန့်ခန့် ကြာမြင့်သဖြင့်၊
+        // ဖုန်းမချိတ်ဆက်မီ ကြိုတင်ဖတ်ထားမှသာ BROM Watchdog Timeout (စက်ပြန်ပွင့်ခြင်း) ကို ကာကွယ်နိုင်ပါမည်။
+        log("[DA READY] Pre-loading Download Agent binaries...", LogLevel.INFO)
+        val preloadedDaV5 = MtkAssetManager.loadDaBytes(context, "MTK_DA_V5.bin")
+        val preloadedDaV6 = MtkAssetManager.loadDaBytes(context, "MTK_DA_V6.bin")
+        val preloadedDaAio = MtkAssetManager.loadDaBytes(context, "MTK_AllInOne_DA.bin")
 
         // 1. Establish BROM Connection
         val isReady = ensureTargetConnected()
@@ -239,10 +218,7 @@ class MtkBromProtocolEngine(
             ?: MtkChipConfigDatabase.findConfig(0x0766)!!
         currentChipConfig = chipConfig
 
-        // 3. Immediately Kill Watchdog Timer
-        disableWatchdog(chipConfig.watchdog)
-
-        // 4. Execute Security SLA/DAA/SBC Bypass (Kamakiri2 + CQDMA + Exploit Payload 624B Jump)
+        // 3. Execute Security SLA/DAA/SBC Bypass
         log("[DA READY] Executing Security SLA/DAA Bypass for ${chipConfig.name}...", LogLevel.INFO)
         val bypassRes = securityEngine.executeBypass(
             context = context,
@@ -261,14 +237,12 @@ class MtkBromProtocolEngine(
             log("[-] Security Bypass Warning: ${bypassRes.exceptionOrNull()?.message}", LogLevel.WARNING)
         }
 
-        // 5. Re-sync USB pipe after exploit execution
+        // 4. Re-sync USB pipe after exploit execution
         targetPhoneUsb.flush(50)
         delay(150)
 
-        // 6. Load Download Agent Binary (Minimum 4KB Required)
-        val daBytes = MtkAssetManager.loadDaBytes(context, "MTK_DA_V5.bin")
-            ?: MtkAssetManager.loadDaBytes(context, "MTK_DA_V6.bin")
-            ?: MtkAssetManager.loadDaBytes(context, "MTK_AllInOne_DA.bin")
+        // 5. Load Download Agent Binary (From pre-loaded cache)
+        val daBytes = preloadedDaV5 ?: preloadedDaV6 ?: preloadedDaAio 
             ?: MtkAssetManager.resolveDaForChip(context, chipConfig)
 
         if (daBytes == null || daBytes.size < 4096) {
@@ -276,7 +250,7 @@ class MtkBromProtocolEngine(
             return@withContext false
         }
 
-        // 7. Parse DA Container
+        // 6. Parse DA Container
         val daInfo = MtkDaParser.parseDaLoader(daBytes, hwCode, defaultLoadAddr = chipConfig.daPayloadAddr)
         if (daInfo == null) {
             log("[-] Failed to parse DA container binary.", LogLevel.ERROR)
@@ -292,7 +266,7 @@ class MtkBromProtocolEngine(
         val daAddress1 = daInfo.stage1?.startAddress ?: chipConfig.daPayloadAddr
         log("[DA READY] Uploading DA Stage 1 (${stage1Bytes.size} bytes) -> 0x%08X...".format(daAddress1), LogLevel.INFO)
 
-        // 8. Upload DA Stage 1 (CMD_SEND_DA 0xD7)
+        // 7. Upload DA Stage 1 (CMD_SEND_DA 0xD7)
         val uploadResult = MtkDaUploader.sendDa(
             usb = targetPhoneUsb,
             daAddress = daAddress1,
@@ -316,7 +290,7 @@ class MtkBromProtocolEngine(
             return@withContext false
         }
 
-        // 9. Jump to DA Stage 1 (CMD_JUMP_DA 0xD5)
+        // 8. Jump to DA Stage 1 (CMD_JUMP_DA 0xD5)
         val jumpResult = MtkDaUploader.jumpDa(
             usb = targetPhoneUsb,
             daAddress = daAddress1,
@@ -328,7 +302,7 @@ class MtkBromProtocolEngine(
             return@withContext false
         }
 
-        // 10. Verify DA Stage 1 Sync Byte (0xC0)
+        // 9. Verify DA Stage 1 Sync Byte (0xC0)
         delay(200)
         val syncByte = ByteArray(1)
         val readSync = targetPhoneUsb.readRaw(syncByte, 4000)
@@ -339,7 +313,7 @@ class MtkBromProtocolEngine(
         }
         log("[+] DA Stage 1 active (0xC0 received). DRAM controller initialized.", LogLevel.SUCCESS)
 
-        // 11. Upload DA Stage 2 (XFLASH) if present
+        // 10. Upload DA Stage 2 (XFLASH) if present
         val stage2Bytes = daInfo.getStage2Bytes()
         if (stage2Bytes != null && stage2Bytes.isNotEmpty()) {
             val xf = MtkXFlashEngine(targetPhoneUsb) { log(it.message, it.level) }
