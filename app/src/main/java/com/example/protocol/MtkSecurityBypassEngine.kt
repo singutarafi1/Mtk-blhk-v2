@@ -45,46 +45,9 @@ class MtkSecurityBypassEngine(
         log("Target Platform: ${chipConfig.name} (${chipConfig.description}) [HWCode: 0x%04X]".format(chipConfig.hwCode), LogLevel.INFO)
         
         try {
-            val payloadFileName = when (chipConfig.hwCode) {
-                0x0766 -> "payloads/mt6765_payload.bin"
-                0x0989 -> "payloads/mt6833_payload.bin"
-                else -> "payloads/mt${chipConfig.hwCode.toString(16)}_payload.bin"
-            }
+            // [FIX]: Payload အတင်းပို့သည့်အဆင့်ကို လုံးဝ ဖယ်ရှားလိုက်ပါသည်။ Kamakiri2 သည် ၄င်း၏ USB Control Transfer မှတစ်ဆင့်သာ အလုပ်လုပ်မည်ဖြစ်သည်။
 
-            var payloadBytes: ByteArray? = null
-            try {
-                payloadBytes = context.assets.open(payloadFileName).use { it.readBytes() }
-                log("Loaded exploit payload: $payloadFileName (${payloadBytes.size} bytes)", LogLevel.INFO)
-            } catch (e: Exception) {
-                log("[-] Payload file $payloadFileName not found in assets!", LogLevel.WARNING)
-            }
-
-            // [FIX]: Payload ကို CMD_WRITE32 သုံးရင် SLA မှ ပိတ်သောကြောင့်
-            // MtkDaUploader (CMD_SEND_DA) ကိုသုံး၍ SRAM သို့ ပို့ပါမည်။
-            if (payloadBytes != null && payloadBytes.isNotEmpty()) {
-                log("Uploading Payload to SRAM 0x%08X via DA Uploader...".format(chipConfig.bromPayloadAddr), LogLevel.INFO)
-                
-                val uploadResult = MtkDaUploader.sendDa(
-                    usb = usb,
-                    daAddress = chipConfig.bromPayloadAddr,
-                    daData = payloadBytes,
-                    sigLen = 0,
-                    maxPacketSize = 0x400,
-                    logCallback = logCallback,
-                    onProgress = {}
-                )
-
-                if (uploadResult.isSuccess) {
-                    log("[+] Payload successfully staged in SRAM.", LogLevel.SUCCESS)
-                } else {
-                    log("[-] Failed to upload payload to SRAM: ${uploadResult.exceptionOrNull()?.message}", LogLevel.ERROR)
-                    return@withContext Result.failure(IllegalStateException("Payload upload failed"))
-                }
-            } else {
-                log("[-] No payload injected! Bypass may fail.", LogLevel.WARNING)
-            }
-
-            // STEP 2: Deploy Kamakiri2 Line Coding Exploit
+            // STEP 1: Deploy Kamakiri2 Line Coding Exploit
             log("[1/2] Configuring USB Exploit Interface (Kamakiri2)...", LogLevel.INFO)
             val kamakiri = MtkKamakiriExploit(usb) { msg, lvl -> log(msg, lvl) }
             val exploitSuccess = kamakiri.exploitKamakiri2(chipConfig.bromPayloadAddr)
@@ -100,7 +63,7 @@ class MtkSecurityBypassEngine(
             usb.flush(50)
             delay(50)
 
-            // STEP 3: Disable BootROM Blacklist via CQDMA Controller
+            // STEP 2: Disable BootROM Blacklist via CQDMA Controller
             log("[2/2] Overriding BootROM Range Blacklist via CQDMA...", LogLevel.INFO)
             val cqdma = MtkCqdmaEngine(
                 read32Func = { addr -> readRegister32(addr) },
@@ -113,6 +76,7 @@ class MtkSecurityBypassEngine(
                 log("[-] CQDMA Blacklist patch warning. Verifying BROM status...", LogLevel.WARNING)
             } 
             
+            // Pipe ရှင်းလင်းရန်
             usb.flush(15)
 
             log("==================================================", LogLevel.SUCCESS)
