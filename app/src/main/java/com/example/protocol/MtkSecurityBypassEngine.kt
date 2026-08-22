@@ -59,47 +59,27 @@ class MtkSecurityBypassEngine(
                 log("[-] Payload file $payloadFileName not found in assets!", LogLevel.WARNING)
             }
 
-            // [FIX]: Payload ကို CMD_WRITE32 (writeRegister32) ဖြင့်သာ SRAM သို့ လှမ်းရေးရပါမည်။
+            // [FIX]: Payload ကို CMD_WRITE32 သုံး၍ အစုလိုက် (Bulk) ရေးသွင်းခြင်းဖြင့် Android USB Drop ဖြစ်ခြင်းကို ကာကွယ်ပါမည်။
             if (payloadBytes != null && payloadBytes.isNotEmpty()) {
-                log("Uploading Payload to SRAM 0x%08X via CMD_WRITE32...".format(chipConfig.bromPayloadAddr), LogLevel.INFO)
+                log("Uploading Payload to SRAM 0x%08X (Bulk Write)...".format(chipConfig.bromPayloadAddr), LogLevel.INFO)
                 
                 val paddedSize = if (payloadBytes.size % 4 != 0) payloadBytes.size + (4 - (payloadBytes.size % 4)) else payloadBytes.size
-                val buffer = ByteBuffer.allocate(paddedSize).order(ByteOrder.LITTLE_ENDIAN)
-                buffer.put(payloadBytes)
-                buffer.position(0)
+                val paddedPayload = ByteArray(paddedSize)
+                System.arraycopy(payloadBytes, 0, paddedPayload, 0, payloadBytes.size)
                 
-                var currentAddr = chipConfig.bromPayloadAddr
-                var successUpload = true
-                var uploadedBytes = 0
+                usb.flush(50) // Clean pipe
                 
-                usb.flush(50)
-                
-                while (buffer.hasRemaining()) {
-                    val value = buffer.int.toLong() and 0xFFFFFFFFL
-                    if (!writeRegister32(currentAddr, value)) {
-                        successUpload = false
-                        break
-                    }
-                    currentAddr += 4
-                    uploadedBytes += 4
-                    
-                    // Loading ကြာပါက အသိပေးရန် Log အချို့ ထုတ်ပေးပါမည်
-                    if (uploadedBytes % 200 == 0) {
-                        log(" -> Uploaded $uploadedBytes / $paddedSize bytes...", LogLevel.INFO)
-                    }
-                }
-                
-                if (successUpload) {
+                if (writeMemoryBlock(chipConfig.bromPayloadAddr, paddedPayload)) {
                     log("[+] Payload successfully staged in SRAM.", LogLevel.SUCCESS)
                 } else {
-                    log("[-] Failed to upload payload to SRAM at 0x%08X.".format(currentAddr), LogLevel.ERROR)
+                    log("[-] Failed to upload payload to SRAM.", LogLevel.ERROR)
                     return@withContext Result.failure(IllegalStateException("Payload upload failed"))
                 }
             } else {
                 log("[-] No payload injected! Bypass may fail.", LogLevel.WARNING)
             }
 
-            // STEP 2: Deploy Kamakiri2 Line Coding Exploit (This jumps to the Payload to disable SLA)
+            // STEP 2: Deploy Kamakiri2 Line Coding Exploit (This jumps to Payload to disable SLA)
             log("[1/2] Configuring USB Exploit Interface (Kamakiri2)...", LogLevel.INFO)
             val kamakiri = MtkKamakiriExploit(usb) { msg, lvl -> log(msg, lvl) }
             val exploitSuccess = kamakiri.exploitKamakiri2(chipConfig.bromPayloadAddr)
@@ -171,6 +151,40 @@ class MtkSecurityBypassEngine(
         }
         if (totalRead < 2) return null
         return ((buf[0].toInt() and 0xFF) shl 8) or (buf[1].toInt() and 0xFF)
+    }
+
+    /**
+     * Fast Bulk Memory Writer for BootROM 
+     */
+    private fun writeMemoryBlock(addr: Long, data: ByteArray): Boolean {
+        val dwords = data.size / 4
+        val buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+
+        // 1. Send CMD_WRITE32
+        if (!echoBytes(byteArrayOf(CMD_WRITE32), 2500)) return false
+
+        // 2. Send Address
+        val addrBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt((addr and 0xFFFFFFFFL).toInt()).array()
+        if (!echoBytes(addrBytes, 2500)) return false
+
+        // 3. Send Count (in DWORDS)
+        val countBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(dwords).array()
+        if (!echoBytes(countBytes, 2500)) return false
+
+        // 4. Expect Status
+        val status = readStatusWord(2500) ?: return false
+        if (status > 0xFF) return false
+
+        // 5. Send Data in a loop (Bulk Stream)
+        for (i in 0 until dwords) {
+            val value = buffer.int
+            val valBytes = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(value).array()
+            if (!echoBytes(valBytes, 1500)) return false
+        }
+
+        // 6. Expect Final Status
+        val status2 = readStatusWord(2500) ?: return false
+        return status2 <= 0xFF
     }
 
     private fun readRegister32(addr: Long): Long {
